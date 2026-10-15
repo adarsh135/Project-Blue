@@ -1,1 +1,259 @@
-# Project-Blue
+# ◈ Project Blue
+
+**A self-hosted agentic AI assistant — with a real credential system, sessions, durable memory and per-user recent searches.**
+
+Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
+
+![status](https://img.shields.io/badge/tests-44%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+
+---
+
+## Why it exists
+
+Most "AI chat" repos are a thin wrapper around one vendor's SDK. Project Blue is the other half of the product: the part that makes an assistant *yours*.
+
+| Capability | What ships |
+| --- | --- |
+| 🔐 **Credential system** | scrypt-hashed passwords (N=32768, per-user salt), revocable login sessions per device, one-time-visible `blue_sk_…` API keys stored only as SHA-256 hashes, and an audit log of every credential event |
+| 🧵 **Sessions** | Cookie sessions (HttpOnly + SameSite=Lax + double-submit CSRF token), device-aware session list, revoke one / revoke all, password change invalidates other devices |
+| 💬 **Conversations** | Persistent chats with derived titles, pin/archive, full-text search across *and* inside conversations |
+| 🔎 **Recent searches** | Every web search the agent (or you) runs is recorded per user with provider, result count, snippets, pinning and day grouping |
+| 🧠 **Memory** | Durable `key → value` facts the agent writes when you say "remember…", injected into every future system prompt |
+| 🧰 **Agent loop** | Streaming tool-calling loop: `web_search`, `fetch_page`, `calculator`, `clock`, `memory`, `session_search`, `search_history` |
+| 🔌 **Any model** | OpenAI-compatible, Anthropic, Gemini, Ollama — or the built-in **Blue Local Engine** that runs with no key at all |
+| 🌗 **Real UI** | Dark/light theme, streaming markdown with copyable code blocks, collapsible tool-call cards, recent-searches rail, memory and account panels |
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/adarsh135/Project-Blue.git
+cd Project-Blue
+npm install
+npm start
+# → http://localhost:4000
+```
+
+Create an account on the sign-up tab and start talking. That's the whole setup — no API key, no database server, no Docker.
+
+Optional, to make it smarter:
+
+```bash
+cp .env.example .env
+# add ANY ONE of:
+#   OPENAI_API_KEY=sk-…        (or any OpenAI-compatible base URL)
+#   ANTHROPIC_API_KEY=sk-ant-…
+#   GEMINI_API_KEY=…
+#   OLLAMA_BASE_URL=http://localhost:11434   (local models, still no key)
+# and optionally a search provider:
+#   TAVILY_API_KEY=… / BRAVE_API_KEY=… / SERPER_API_KEY=…
+```
+
+Blue picks the provider automatically; per-account you can switch provider, model, temperature, system prompt and enabled tools in **Settings**.
+
+---
+
+## Try these
+
+| Message | What happens |
+| --- | --- |
+| `remember my timezone is Asia/Kolkata` | agent writes a memory, then uses it in later answers |
+| `what time is it in Asia/Kolkata?` | `clock` tool, real IANA timezone maths |
+| `calc (1250 * 1.18) / 3` | `calculator` tool — exact, no hallucinated arithmetic |
+| `search the web for the latest Node.js LTS release` | `web_search` → cited markdown links, logged in Recent searches |
+| `show my recent searches` | `search_history` tool renders your own search log |
+| `find in my chats about sqlite` | `session_search` across every message you've ever sent |
+| `who are you?` | Blue explains its own credential/session/memory architecture |
+
+---
+
+## Architecture
+
+```
+                         ┌──────────────────────── browser ────────────────────────┐
+                         │  index.html + ES modules   (no build step, no bundler)  │
+                         │  api.js → cookie + x-blue-csrf header, SSE reader        │
+                         └───────────────▲──────────────────────┬──────────────────┘
+                                         │ fetch/SSE            │
+┌────────────────────────────────────────┴──────────────────────▼──────────────────┐
+│ server/index.js — express 5                                                      │
+│  security headers · CSP · JSON body limit · request log · auth middleware         │
+│                                                                                  │
+│  /api/auth/*  auth.routes.js      register · login · logout · me · password ·     │
+│                                   sessions (devices) · api keys · audit events    │
+│  /api/*       api.routes.js       conversations · SSE chat · recent searches ·    │
+│                                   memories · settings · tools · stats             │
+│                                                                                  │
+│  agent/agent.js  ← the loop: history → tools → stream → tool calls → stream again │
+│    ├── prompt.js       system prompt: identity, tool rules, memory, search log     │
+│    ├── providers.js    streaming adapters (OpenAI / Anthropic / Gemini / Ollama)   │
+│    ├── local-engine.js offline fallback engine (intent → tool → answer writer)     │
+│    ├── tools.js        tool schemas + execution + result rendering                 │
+│    └── math.js         sandboxed arithmetic parser (no eval)                       │
+│                                                                                  │
+│  db.js — node:sqlite schema, migrations, queries                                  │
+│  auth.js — scrypt, sessions, API keys, CSRF, rate limiting                        │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │
+                                 data/blue.db (SQLite, WAL)
+```
+
+### The agent loop, concretely
+
+1. The user's turn is persisted, the chat is titled from the first message.
+2. Context is assembled: custom/system prompt + stored memories + the 8 most recent searches + up to 400 stored messages.
+3. The provider streams tokens. `text` events go straight to the browser; `tool_call` events are queued.
+4. If the model asked for tools, the assistant turn is persisted *with its tool calls*, each tool runs, and every result is persisted as a `tool` message.
+5. Results are fed back and the model streams again — up to `BLUE_MAX_TOOL_ROUNDS` (default 4) rounds, so no runaway loops.
+6. The final answer is persisted with provider, model, latency and token counts. If a remote provider is unreachable, Blue emits a visible notice and re-answers with the offline engine rather than showing an error.
+
+See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the data model, the auth flow and the SSE protocol.
+
+---
+
+## The Blue Local Engine (offline mode)
+
+With no provider key configured, `local-engine.js` takes over. It is **not** a language model — it's an honest deterministic planner:
+
+* classifies the request (greeting, identity, capabilities, web search, maths, clock, memory read/write, session search, search history, general);
+* emits the same `tool_call` events a model would, so the agent loop, persistence and UI are identical;
+* writes the final answer **from the tool output** — real calculators, real timestamps, real memories, real search results — instead of inventing facts;
+* explains failures ("`web_search` failed because no provider answered — add `TAVILY_API_KEY`…") rather than hallucinating an answer.
+
+That means the credential system, sessions, recent searches, memory and the whole UI are fully exercisable with zero keys, and plugging in a model later changes only the brain, not the plumbing.
+
+---
+
+## HTTP API
+
+Everything the web app does is a documented JSON endpoint, so you can drive Blue from a script.
+
+```bash
+# 1. create an account (returns a session cookie + CSRF cookie)
+curl -c jar -X POST localhost:4000/api/auth/register \
+  -H 'content-type: application/json' \
+  -d '{"name":"Ada","email":"ada@example.com","password":"BlueDemo2026!"}'
+
+# 2. mint an API key for machine access
+curl -b jar -X POST localhost:4000/api/auth/keys \
+  -H 'content-type: application/json' -H "x-blue-csrf: $(grep blue_csrf jar | awk '{print $7}')" \
+  -d '{"label":"cli"}'
+# → {"plaintext":"blue_sk_1a2b3c4d_…"}   (shown once)
+
+# 3. one-shot chat with a tool-using agent
+curl -X POST localhost:4000/api/chat \
+  -H "Authorization: Bearer blue_sk_…" -H 'content-type: application/json' \
+  -d '{"content":"search for the latest sqlite release"}'
+# → {"answer":"…","tools_used":["web_search"],"provider":"local", …}
+```
+
+| Method & path | Purpose |
+| --- | --- |
+| `POST /api/auth/register` · `login` · `logout` | account + session lifecycle |
+| `GET/PATCH /api/auth/me` | profile |
+| `POST /api/auth/password` | change password (revokes other sessions) |
+| `GET/DELETE /api/auth/sessions[/:id]` | list / revoke login sessions |
+| `GET/POST /api/auth/keys`, `DELETE /api/auth/keys/:id` | API keys |
+| `GET /api/auth/events` | credential audit log |
+| `GET/POST /api/sessions`, `GET/PATCH/DELETE /api/sessions/:id` | conversations |
+| `POST /api/sessions/:id/messages` | **SSE** chat stream (`start`, `title`, `text`, `tool_start`, `tool_result`, `usage`, `done`, `error`, `close`) |
+| `POST /api/chat` | one-shot JSON chat (great for API keys) |
+| `GET /api/messages/search?q=` | search every message you've sent |
+| `GET /api/searches` · `POST /api/searches` · `POST /api/searches/:id/pin` · `DELETE /api/searches[/:id]` | recent searches |
+| `GET/POST /api/memories`, `DELETE /api/memories/:id` | memory |
+| `GET/PUT /api/settings`, `GET /api/tools` | engine + tool configuration |
+| `GET /api/stats`, `GET /api/status` | counters, engine health |
+
+---
+
+## Security notes
+
+* **Passwords** — scrypt (`N=32768, r=8, p=1`, 64-byte key, per-user random salt). Login failures are indistinguishable between "unknown email" and "wrong password".
+* **Sessions** — random 256-bit token, only its SHA-256 stored. HttpOnly + SameSite=Lax cookie with a separate readable CSRF cookie; state-changing requests must present the matching `x-blue-csrf` header or a same-origin `Origin`/`Referer`.
+* **API keys** — `blue_sk_<prefix>_<secret>`; only the SHA-256 of the secret is stored, the plaintext is shown exactly once, comparison is timing-safe, and keys can be revoked per key.
+* **Rate limiting** — login/register limits per IP, per-user message throughput cap.
+* **Isolation** — every query is scoped by `user_id`; a foreign chat id returns 404, never data.
+* **Headers** — strict CSP (`default-src 'self'`), `nosniff`, referrer policy, HSTS + `X-Frame-Options` in production. Markdown is escaped before formatting, so model or web output cannot inject markup.
+* **Tools** — the calculator is a hand-written recursive-descent parser (no `eval`), `fetch_page` only allows `http(s)`, and the schema keeps Gemini/Anthropic happy without loosening validation.
+
+Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=https://…`), set `NODE_ENV=production`, and back up `data/blue.db`.
+
+---
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` / `HOST` | `4000` / `0.0.0.0` | listen address |
+| `BLUE_SESSION_SECRET` | generated into `data/.session-secret` | session signing/derivation secret |
+| `SESSION_TTL_HOURS` | `168` | login session lifetime |
+| `BLUE_DATA_DIR` | `./data` | SQLite + secret location |
+| `BLUE_MAX_TOOL_ROUNDS` | `4` | agent loop cap per turn |
+| `BLUE_FORCE_LOCAL_ENGINE` | `false` | ignore provider keys, always use the offline engine |
+| `BLUE_SEARCH_OFFLINE` | `false` | never make outbound search requests |
+| `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
+| `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
+| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | search providers (keyless DuckDuckGo otherwise) |
+
+---
+
+## Tests
+
+```bash
+npm test        # 44 tests, ~8s, no network required
+```
+
+* `tests/math.test.js` — the calculator, including rejected code-execution attempts
+* `tests/markdown.test.js` — escaping/XSS, tables, links, fenced code
+* `tests/local-engine.test.js` — intent routing, tool selection, answer synthesis, no stale tool output
+* `tests/api.test.js` — boots the real server on a random port: registration validation, identical login failures, CSRF blocking, API-key auth, per-user isolation, search recording/pinning, session revocation, password change
+* `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
+* `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
+
+---
+
+## Project layout
+
+```
+server/
+  index.js            express app, headers, static hosting, error handling
+  config.js           env + .env loading, provider discovery
+  db.js               schema, migrations, all queries
+  auth.js             scrypt, sessions, API keys, CSRF, rate limiting
+  routes/auth.routes.js  credential + account endpoints
+  routes/api.routes.js   product endpoints incl. the SSE chat stream
+  agent/agent.js      the agent loop
+  agent/prompt.js     system prompt construction
+  agent/providers.js  streaming adapters per provider
+  agent/local-engine.js  offline deterministic engine
+  agent/tools.js      tool schemas, execution, rendering
+  agent/math.js       sandboxed arithmetic
+public/
+  index.html          auth screen + app shell (all views)
+  css/app.css         design tokens, dark/light themes, components
+  js/app.js           boot, auth, routing, event bus wiring
+  js/chat.js          transcript rendering + SSE streaming
+  js/panels.js        conversations, searches, memory, tools, settings, account
+  js/api.js           fetch wrapper (cookies + CSRF) and SSE reader
+  js/markdown.js      XSS-safe markdown renderer
+  js/ui.js            DOM helpers, toasts, modals
+  js/store.js         client state + event bus
+tests/                44 tests
+docs/ARCHITECTURE.md  data model, flows, SSE protocol
+```
+
+---
+
+## Roadmap
+
+- [ ] Tool plugins loaded from a `tools/` folder (bring your own tools)
+- [ ] File attachments and vision input
+- [ ] Multi-user spaces, sharing and read-only links
+- [ ] Background jobs (scheduled searches, digests)
+- [ ] Postgres adapter for horizontal scale
+- [ ] Docker image
+
+## License
+
+MIT — do what you want, keep the notice.
