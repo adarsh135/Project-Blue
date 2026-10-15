@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="blue">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Project Blue — self-hosted AI assistant</title>
+<meta name="description" content="Blue: an agentic AI assistant with credential auth, sessions, memory and recent searches." />
+<meta name="color-scheme" content="dark light" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232f7bff'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Ccircle cx='32' cy='32' r='13' fill='none' stroke='white' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='4.5' fill='white'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+
+<!-- ============================ AUTH ============================ -->
+<section id="auth-screen">
+  <div class="auth-hero">
+    <div class="brand">
+      <div class="brand-mark">◈</div>
+      <div>Project <span style="color:var(--accent-2)">Blue</span></div>
+    </div>
+    <h1>Your own <span>agentic AI</span>,<br />on your own server.</h1>
+    <p class="lede">
+      Blue is a self-hosted assistant with the plumbing that matters: real accounts, revocable
+      sessions, hashed API keys, an agent loop with tools, durable memory and a per-user
+      recent-search history. No key required to start — plug in OpenAI, Anthropic, Gemini or
+      a local Ollama when you want a bigger brain.
+    </p>
+    <div class="feature-list">
+      <div class="feature"><div class="ic">🔐</div><div><b>Credential system</b><span class="d">scrypt password hashing, login sessions you can revoke per device, and <code>blue_sk_…</code> API keys stored only as hashes.</span></div></div>
+      <div class="feature"><div class="ic">🧵</div><div><b>Sessions &amp; history</b><span class="d">Every conversation is persisted and searchable — across chats and inside one chat.</span></div></div>
+      <div class="feature"><div class="ic">🔎</div><div><b>Recent searches</b><span class="d">Each web search the agent runs is logged per user, pinned, replayed or cleared.</span></div></div>
+      <div class="feature"><div class="ic">🧠</div><div><b>Memory + tools</b><span class="d">web search, page fetch, calculator, clock, memory and session search, in one loop.</span></div></div>
+    </div>
+  </div>
+
+  <div class="auth-panel">
+    <div class="auth-card">
+      <div class="tabs">
+        <button class="tab active" data-tab="login">Sign in</button>
+        <button class="tab" data-tab="register">Create account</button>
+      </div>
+
+      <div class="auth-error" id="auth-error"></div>
+
+      <form id="login-form">
+        <div class="field">
+          <label for="login-email">Email</label>
+          <input class="input" id="login-email" type="email" autocomplete="username" placeholder="you@example.com" required />
+        </div>
+        <div class="field">
+          <label for="login-password">Password</label>
+          <input class="input" id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" required />
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" id="login-submit">Sign in</button>
+      </form>
+
+      <form id="register-form" style="display:none">
+        <div class="field">
+          <label for="reg-name">Name</label>
+          <input class="input" id="reg-name" autocomplete="name" placeholder="Ada Lovelace" />
+        </div>
+        <div class="field">
+          <label for="reg-email">Email</label>
+          <input class="input" id="reg-email" type="email" autocomplete="email" placeholder="you@example.com" required />
+        </div>
+        <div class="field">
+          <label for="reg-password">Password</label>
+          <input class="input" id="reg-password" type="password" autocomplete="new-password" placeholder="At least 8 characters" required />
+          <span class="hint">8+ characters with at least one letter and one number or symbol. Hashed with scrypt — never stored in plain text.</span>
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" id="register-submit">Create account</button>
+      </form>
+
+      <p class="form-note">
+        Sessions last <b id="ttl-days">7</b> days, are revocable from Account → Sessions, and are signed with an
+        HttpOnly cookie plus a CSRF token. Your chats, searches and memories stay in this server's SQLite database.
+      </p>
+      <div class="auth-foot">
+        <span class="pill" id="engine-pill"><span class="dot"></span> checking engine…</span>
+        <span class="pill">v<span id="version-pill">1.0.0</span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= APP ============================= -->
+<div id="app">
+  <!-- ---------------------------- sidebar ---------------------------- -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-top">
+      <div class="row-between">
+        <div class="brand" style="font-size:16px"><div class="brand-mark" style="width:30px;height:30px;font-size:15px">◈</div> Blue</div>
+        <button class="btn btn-ghost btn-sm" id="theme-toggle" title="Toggle theme">🌗</button>
+      </div>
+      <button class="btn btn-primary btn-block" id="new-chat">✚ &nbsp;New chat</button>
+      <input class="input" id="conv-filter" placeholder="Filter conversations…" style="padding:8px 11px;font-size:13px" />
+    </div>
+
+    <div class="sidebar-scroll">
+      <nav class="nav-group">
+        <button class="nav-item active" data-view="chat"><span class="ic">💬</span> Chat</button>
+        <button class="nav-item" data-view="searches"><span class="ic">🔎</span> Recent searches <span class="count" id="count-searches">0</span></button>
+        <button class="nav-item" data-view="memories"><span class="ic">🧠</span> Memory <span class="count" id="count-memories">0</span></button>
+        <button class="nav-item" data-view="tools"><span class="ic">🧰</span> Tools</button>
+        <button class="nav-item" data-view="settings"><span class="ic">⚙️</span> Settings</button>
+        <button class="nav-item" data-view="account"><span class="ic">🔐</span> Account &amp; sessions</button>
+      </nav>
+
+      <div class="nav-title">Conversations</div>
+      <div id="conv-list"></div>
+    </div>
+
+    <div class="sidebar-bottom">
+      <div class="menu" id="user-menu">
+        <button data-view="account">🔐 Account, sessions &amp; keys</button>
+        <button data-view="settings">⚙️ Model settings</button>
+        <button data-view="searches">🔎 Recent searches</button>
+        <div class="sep"></div>
+        <button id="menu-signout" style="color:var(--err)">⎋ Sign out</button>
+      </div>
+      <button class="user-chip" id="user-chip">
+        <span class="avatar" id="user-avatar">?</span>
+        <span class="who"><b id="user-name">…</b><span id="user-email">…</span></span>
+        <span class="muted">⋮</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ----------------------------- main ----------------------------- -->
+  <main class="main">
+    <header class="topbar">
+      <button class="btn btn-ghost btn-sm mobile-only" id="sidebar-toggle">☰</button>
+      <div style="min-width:0">
+        <h2 id="topbar-title">New chat</h2>
+        <div class="sub" id="topbar-sub">Blue Local Engine · offline</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="engine-select">
+        <select class="select" id="provider-select" title="Model provider"></select>
+        <input class="input" id="model-input" style="width:190px;padding:7px 10px;font-size:12.5px" title="Model name" />
+        <button class="btn btn-ghost btn-sm" id="rail-toggle" title="Recent searches panel">🔎</button>
+      </div>
+    </header>
+
+    <!-- chat view -->
+    <section class="view" id="view-chat" style="display:flex;flex-direction:column;padding:0;overflow:hidden">
+      <div class="messages" id="messages">
+        <div class="messages-inner" id="messages-inner">
+          <div class="hero-empty" id="welcome">
+            <div style="font-size:34px">◈</div>
+            <h2 style="margin:12px 0 6px;font-size:24px;letter-spacing:-0.02em">Hello, <span id="welcome-name">there</span>.</h2>
+            <p class="muted" style="max-width:56ch;margin:0 auto;line-height:1.7">
+              I'm <b>Blue</b> — an agentic assistant running on this server. I can search the web, read pages,
+              do maths, remember facts about you, and dig through your earlier chats and searches.
+            </p>
+            <div class="suggestions" style="justify-content:center;margin-top:22px">
+              <button class="suggestion">search for the latest Node.js LTS release</button>
+              <button class="suggestion">remember my timezone is Asia/Kolkata</button>
+              <button class="suggestion">show my recent searches</button>
+              <button class="suggestion">what can you do?</button>
+              <button class="suggestion">calc (1250 * 1.18) / 3</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <div class="composer-box">
+            <textarea id="input" rows="1" placeholder="Ask Blue anything…  (Enter to send, Shift+Enter for a new line)"></textarea>
+            <div class="composer-bar">
+              <div class="tool-toggles" id="tool-toggles"></div>
+              <span class="hint"><span class="kbd">Enter</span> send · <span class="kbd">Shift</span>+<span class="kbd">Enter</span> newline</span>
+              <button class="btn btn-ghost btn-sm" id="stop-btn" style="display:none">■ Stop</button>
+              <button class="btn btn-primary btn-sm" id="send-btn">Send ➤</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- searches view -->
+    <section class="view" id="view-searches" style="display:none">
+      <div class="view-inner">
+        <div class="card">
+          <div class="row-between">
+            <div>
+              <h3>🔎 Recent searches</h3>
+              <p class="desc">Every search Blue runs is written to your account with its provider, result count and timestamp. Run one directly, pin the useful ones, or clear the noise.</p>
+            </div>
+          </div>
+          <div class="row" style="margin-bottom:14px">
+            <input class="input" id="search-box" placeholder="Search the web now…" />
+            <button class="btn btn-primary" id="search-run">Search</button>
+            <button class="btn btn-ghost btn-sm" id="search-clear">Clear unpinned</button>
+          </div>
+          <div class="row" style="margin-bottom:12px">
+            <input class="input" id="search-filter" placeholder="Filter my search history…" style="max-width:320px" />
+            <button class="btn btn-sm" id="search-pinned-only">★ Pinned only</button>
+          </div>
+          <div id="search-results"></div>
+          <div id="search-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- memories view -->
+    <section class="view" id="view-memories" style="display:none">
+      <div class="view-inner">
+        <div class="card">
+          <h3>🧠 Memory</h3>
+          <p class="desc">Durable facts Blue keeps about you. The agent writes these when you say "remember…", and they're injected into every future system prompt.</p>
+          <div class="row" style="margin-bottom:14px">
+            <input class="input" id="mem-key" placeholder="key (e.g. timezone)" style="max-width:220px" />
+            <input class="input" id="mem-value" placeholder="value (e.g. Asia/Kolkata)" />
+            <button class="btn btn-primary" id="mem-add">Save</button>
+          </div>
+          <div id="mem-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- tools view -->
+    <section class="view" id="view-tools" style="display:none">
+      <div class="view-inner">
+        <div class="card">
+          <h3>🧰 Tools</h3>
+          <p class="desc">Tools are the difference between a chatbot and an agent. Blue decides when to call these; you decide which are available.</p>
+          <div id="tools-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- settings view -->
+    <section class="view" id="view-settings" style="display:none">
+      <div class="view-inner">
+        <div class="card">
+          <h3>⚙️ Model</h3>
+          <p class="desc">Pick the brain behind the agent loop. Everything else — auth, sessions, memory, search history — stays identical.</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>Provider</label>
+              <select class="select" id="set-provider"></select>
+            </div>
+            <div class="field">
+              <label>Model</label>
+              <input class="input" id="set-model" />
+            </div>
+          </div>
+          <div class="field">
+            <label>Temperature · <span id="temp-value">0.7</span></label>
+            <input type="range" min="0" max="1.5" step="0.05" id="set-temp" style="width:100%" />
+          </div>
+          <div class="field">
+            <label>System prompt (blank = Blue's default)</label>
+            <textarea class="textarea" id="set-prompt" placeholder="You are Blue…"></textarea>
+          </div>
+          <div class="row">
+            <button class="btn btn-primary" id="set-save">Save settings</button>
+            <button class="btn" id="set-default">Restore default prompt</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🔌 Configured providers</h3>
+          <p class="desc">Providers are enabled by environment variables on the server. Add a key to <code>.env</code> and restart — no code changes needed.</p>
+          <div id="provider-list"></div>
+          <pre class="mono small" style="background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto">OPENAI_API_KEY=sk-…        # OpenAI or any compatible endpoint
+ANTHROPIC_API_KEY=sk-ant-…  # Claude
+GEMINI_API_KEY=…            # Gemini
+OLLAMA_BASE_URL=http://localhost:11434   # local models, no key
+TAVILY_API_KEY=…            # better web search (optional)</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- account view -->
+    <section class="view" id="view-account" style="display:none">
+      <div class="view-inner">
+        <div class="stat-row" id="stat-row"></div>
+
+        <div class="card">
+          <h3>👤 Profile</h3>
+          <p class="desc">Your identity for this server.</p>
+          <div class="grid-2">
+            <div class="field"><label>Name</label><input class="input" id="acc-name" /></div>
+            <div class="field"><label>Email</label><input class="input" id="acc-email" /></div>
+          </div>
+          <button class="btn btn-primary" id="acc-save">Save profile</button>
+        </div>
+
+        <div class="card">
+          <h3>🔑 Change password</h3>
+          <p class="desc">Passwords are hashed with scrypt (N=32768) and a per-user salt. Changing it signs out every other device.</p>
+          <div class="grid-2">
+            <div class="field"><label>Current password</label><input class="input" type="password" id="pw-current" autocomplete="current-password" /></div>
+            <div class="field"><label>New password</label><input class="input" type="password" id="pw-new" autocomplete="new-password" /></div>
+          </div>
+          <button class="btn" id="pw-save">Update password</button>
+        </div>
+
+        <div class="card">
+          <h3>🧵 Sessions <span class="pill" id="session-count">0</span></h3>
+          <p class="desc">Each sign-in is a separate, revocable session. Revoke anything you don't recognise.</p>
+          <div id="session-list"></div>
+          <button class="btn btn-danger btn-sm" id="session-revoke-all">Sign out all other devices</button>
+        </div>
+
+        <div class="card">
+          <h3>🔐 API keys</h3>
+          <p class="desc">Machine credentials for scripts and integrations. The secret is shown once; only a SHA-256 hash is stored.</p>
+          <div class="row" style="margin-bottom:12px">
+            <input class="input" id="key-label" placeholder="label (e.g. laptop CLI)" style="max-width:260px" />
+            <button class="btn btn-primary" id="key-create">Create key</button>
+          </div>
+          <div id="key-list"></div>
+          <div class="divider"></div>
+          <p class="desc" style="margin-bottom:6px">Use it as a bearer token:</p>
+          <pre class="mono small" style="background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto">curl -s http://localhost:4000/api/chat \
+  -H "Authorization: Bearer blue_sk_…" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"search for the latest SQLite release"}'</pre>
+        </div>
+
+        <div class="card">
+          <h3>📜 Auth activity</h3>
+          <p class="desc">Recent credential events on this account (logins, failed attempts, key and session changes).</p>
+          <div id="event-list"></div>
+        </div>
+
+        <div class="card">
+          <h3 style="color:var(--err)">⚠️ Danger zone</h3>
+          <p class="desc">Deleting the account erases every chat, search, memory and key. This cannot be undone.</p>
+          <button class="btn btn-danger" id="account-delete">Delete my account</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ------------------------------ rail ------------------------------ -->
+  <aside class="rail" id="rail">
+    <div class="rail-head">
+      <h3>🔎 Recent searches</h3>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" id="rail-view-all">All</button>
+    </div>
+    <div class="rail-body" id="rail-body"></div>
+  </aside>
+</div>
+
+<div id="toasts"></div>
+<div id="modal-root"></div>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
