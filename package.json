@@ -1,0 +1,22 @@
+{
+  "name": "project-blue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Project Blue — a self-hosted agentic AI assistant with credential auth, sessions, memory and recent searches.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings server/index.js",
+    "dev": "node --no-warnings --watch server/index.js",
+    "test": "node --no-warnings --test \"tests/**/*.test.js\""
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.0",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}
