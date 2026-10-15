@@ -37,17 +37,17 @@ const isSecureRequest = (req) => {
   return req.secure;
 };
 
-function startSession(req, res, user, event) {
+async function startSession(req, res, user, event) {
   const { token } = newSessionToken();
-  const session = createSession({
+  const session = await createSession({
     userId: user.id,
     token,
     userAgent: req.headers['user-agent'] || '',
     ip: clientIp(req),
   });
   res.setHeader('Set-Cookie', sessionCookieHeaders(token, { secure: isSecureRequest(req) }));
-  run('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?', now(), now(), user.id);
-  audit({
+  await run('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?', now(), now(), user.id);
+  await audit({
     userId: user.id,
     email: user.email,
     event,
@@ -71,14 +71,14 @@ authRouter.post('/register', registerLimiter, async (req, res, next) => {
     }
     const problem = passwordProblem(password);
     if (problem) return res.status(400).json({ error: problem });
-    if (findUserByEmail(email)) {
-      audit({ email, event: 'register', status: 'exists', ip: clientIp(req), userAgent: req.headers['user-agent'] });
+    if (await findUserByEmail(email)) {
+      await audit({ email, event: 'register', status: 'exists', ip: clientIp(req), userAgent: req.headers['user-agent'] });
       return res.status(409).json({ error: 'An account with that email already exists.' });
     }
 
     const user = await createUser({ email, name, password });
-    const session = startSession(req, res, user, 'register');
-    return res.status(201).json({ user: publicUser(user), sessionId: session.id, settings: getSettings(user.id) });
+    const session = await startSession(req, res, user, 'register');
+    return res.status(201).json({ user: publicUser(user), sessionId: session.id, settings: await getSettings(user.id) });
   } catch (error) {
     return next(error);
   }
@@ -89,10 +89,10 @@ authRouter.post('/login', authLimiter, async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password || '');
-    const user = findUserByEmail(email);
+    const user = await findUserByEmail(email);
 
     if (!user || !(await verifyPassword(password, user.password_hash))) {
-      audit({
+      await audit({
         userId: user?.id || null,
         email,
         event: 'login',
@@ -106,50 +106,50 @@ authRouter.post('/login', authLimiter, async (req, res, next) => {
     }
 
     if (!user.password_hash.startsWith('scrypt')) {
-      run('UPDATE users SET password_hash = ? WHERE id = ?', await hashPassword(password), user.id);
+      await run('UPDATE users SET password_hash = ? WHERE id = ?', await hashPassword(password), user.id);
     }
 
-    const session = startSession(req, res, user, 'login');
-    return res.json({ user: publicUser(user), sessionId: session.id, settings: getSettings(user.id) });
+    const session = await startSession(req, res, user, 'login');
+    return res.json({ user: publicUser(user), sessionId: session.id, settings: await getSettings(user.id) });
   } catch (error) {
     return next(error);
   }
 });
 
 /* -------------------------------- logout -------------------------- */
-authRouter.post('/logout', (req, res) => {
+authRouter.post('/logout', async (req, res) => {
   const token = parseCookies(req)[SESSION_COOKIE];
   if (token) {
     const sessionId = token.split('.')[0];
-    audit({ userId: req.user?.id || null, event: 'logout', status: 'ok', ip: clientIp(req), detail: sessionId });
-    run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), sessionId);
+    await audit({ userId: req.user?.id || null, event: 'logout', status: 'ok', ip: clientIp(req), detail: sessionId });
+    await run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), sessionId);
   }
   res.setHeader('Set-Cookie', clearCookieHeader());
   return res.json({ ok: true });
 });
 
 /* --------------------------------- me ----------------------------- */
-authRouter.get('/me', (req, res) => {
+authRouter.get('/me', async (req, res) => {
   if (!req.user) return res.json({ user: null, authenticated: false });
   return res.json({
     user: publicUser(req.user),
     authenticated: true,
     auth: req.auth,
-    settings: getSettings(req.user.id),
+    settings: await getSettings(req.user.id),
   });
 });
 
-authRouter.patch('/me', requireUser, (req, res) => {
+authRouter.patch('/me', requireUser, async (req, res) => {
   const name = String(req.body?.name || '').trim();
-  if (name) run('UPDATE users SET name = ?, updated_at = ? WHERE id = ?', name.slice(0, 80), now(), req.user.id);
+  if (name) await run('UPDATE users SET name = ?, updated_at = ? WHERE id = ?', name.slice(0, 80), now(), req.user.id);
   const email = req.body?.email === undefined ? null : normalizeEmail(req.body.email);
   if (email && email !== req.user.email) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
-    if (findUserByEmail(email)) return res.status(409).json({ error: 'That email is already in use.' });
-    run('UPDATE users SET email = ?, updated_at = ? WHERE id = ?', email, now(), req.user.id);
-    audit({ userId: req.user.id, email, event: 'email_change', status: 'ok', ip: clientIp(req) });
+    if (await findUserByEmail(email)) return res.status(409).json({ error: 'That email is already in use.' });
+    await run('UPDATE users SET email = ?, updated_at = ? WHERE id = ?', email, now(), req.user.id);
+    await audit({ userId: req.user.id, email, event: 'email_change', status: 'ok', ip: clientIp(req) });
   }
-  return res.json({ user: publicUser(findUserById(req.user.id)) });
+  return res.json({ user: publicUser(await findUserById(req.user.id)) });
 });
 
 /* ------------------------------ password -------------------------- */
@@ -157,17 +157,17 @@ authRouter.post('/password', requireUser, authLimiter, async (req, res, next) =>
   try {
     const current = String(req.body?.current_password || '');
     const next_ = String(req.body?.new_password || '');
-    const user = findUserById(req.user.id);
+    const user = await findUserById(req.user.id);
     if (!(await verifyPassword(current, user.password_hash))) {
-      audit({ userId: user.id, email: user.email, event: 'password_change', status: 'denied', ip: clientIp(req) });
+      await audit({ userId: user.id, email: user.email, event: 'password_change', status: 'denied', ip: clientIp(req) });
       return res.status(403).json({ error: 'Current password is incorrect.' });
     }
     const problem = passwordProblem(next_);
     if (problem) return res.status(400).json({ error: problem });
 
-    run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(next_), now(), user.id);
-    revokeAllSessions(user.id, req.auth?.sessionId || null);
-    audit({ userId: user.id, email: user.email, event: 'password_change', status: 'ok', ip: clientIp(req) });
+    await run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', await hashPassword(next_), now(), user.id);
+    await revokeAllSessions(user.id, req.auth?.sessionId || null);
+    await audit({ userId: user.id, email: user.email, event: 'password_change', status: 'ok', ip: clientIp(req) });
     return res.json({ ok: true, message: 'Password updated. All other sessions were signed out.' });
   } catch (error) {
     return next(error);
@@ -175,10 +175,10 @@ authRouter.post('/password', requireUser, authLimiter, async (req, res, next) =>
 });
 
 /* ------------------------- sessions (devices) --------------------- */
-authRouter.get('/sessions', requireUser, (req, res) => {
+authRouter.get('/sessions', requireUser, async (req, res) => {
   const currentId = req.auth?.kind === 'session' ? req.auth.sessionId : null;
   res.json({
-    sessions: listSessions(req.user.id).map((s) => ({
+    sessions: (await listSessions(req.user.id)).map((s) => ({
       ...s,
       current: s.id === currentId,
       active: !s.revoked_at && new Date(s.expires_at).getTime() > Date.now(),
@@ -186,22 +186,22 @@ authRouter.get('/sessions', requireUser, (req, res) => {
   });
 });
 
-authRouter.delete('/sessions/:id', requireUser, (req, res) => {
-  revokeSession(req.user.id, req.params.id);
-  audit({ userId: req.user.id, event: 'session_revoke', status: 'ok', ip: clientIp(req), detail: req.params.id });
+authRouter.delete('/sessions/:id', requireUser, async (req, res) => {
+  await revokeSession(req.user.id, req.params.id);
+  await audit({ userId: req.user.id, event: 'session_revoke', status: 'ok', ip: clientIp(req), detail: req.params.id });
   res.json({ ok: true });
 });
 
-authRouter.delete('/sessions', requireUser, (req, res) => {
-  revokeAllSessions(req.user.id, req.auth?.kind === 'session' ? req.auth.sessionId : null);
-  audit({ userId: req.user.id, event: 'session_revoke_all', status: 'ok', ip: clientIp(req) });
+authRouter.delete('/sessions', requireUser, async (req, res) => {
+  await revokeAllSessions(req.user.id, req.auth?.kind === 'session' ? req.auth.sessionId : null);
+  await audit({ userId: req.user.id, event: 'session_revoke_all', status: 'ok', ip: clientIp(req) });
   res.json({ ok: true });
 });
 
 /* ------------------------------ api keys -------------------------- */
-authRouter.get('/keys', requireUser, (req, res) => {
+authRouter.get('/keys', requireUser, async (req, res) => {
   res.json({
-    keys: listApiKeys(req.user.id).map((k) => ({
+    keys: (await listApiKeys(req.user.id)).map((k) => ({
       ...k,
       scopes: JSON.parse(k.scopes || '[]'),
       active: !k.revoked_at,
@@ -209,11 +209,11 @@ authRouter.get('/keys', requireUser, (req, res) => {
   });
 });
 
-authRouter.post('/keys', requireUser, (req, res) => {
+authRouter.post('/keys', requireUser, async (req, res) => {
   const label = String(req.body?.label || 'API key').slice(0, 60);
   const scopes = Array.isArray(req.body?.scopes) && req.body.scopes.length ? req.body.scopes.slice(0, 8) : ['chat'];
-  const key = createApiKey(req.user.id, label, scopes);
-  audit({ userId: req.user.id, event: 'api_key_create', status: 'ok', ip: clientIp(req), detail: key.id });
+  const key = await createApiKey(req.user.id, label, scopes);
+  await audit({ userId: req.user.id, event: 'api_key_create', status: 'ok', ip: clientIp(req), detail: key.id });
   res.status(201).json({
     key: { id: key.id, label: key.label, prefix: key.prefix },
     // Shown exactly once — only the hash is stored.
@@ -222,15 +222,15 @@ authRouter.post('/keys', requireUser, (req, res) => {
   });
 });
 
-authRouter.delete('/keys/:id', requireUser, (req, res) => {
-  revokeApiKey(req.user.id, req.params.id);
-  audit({ userId: req.user.id, event: 'api_key_revoke', status: 'ok', ip: clientIp(req), detail: req.params.id });
+authRouter.delete('/keys/:id', requireUser, async (req, res) => {
+  await revokeApiKey(req.user.id, req.params.id);
+  await audit({ userId: req.user.id, event: 'api_key_revoke', status: 'ok', ip: clientIp(req), detail: req.params.id });
   res.json({ ok: true });
 });
 
 /* --------------------------- auth activity ------------------------ */
-authRouter.get('/events', requireUser, (req, res) => {
-  const rows = all(
+authRouter.get('/events', requireUser, async (req, res) => {
+  const rows = await all(
     `SELECT event, status, ip, user_agent, detail, created_at FROM auth_events
      WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
     req.user.id,
@@ -253,13 +253,13 @@ authRouter.get('/providers', (req, res) => {
 authRouter.delete('/account', requireUser, async (req, res, next) => {
   try {
     const password = String(req.body?.password || '');
-    const user = findUserById(req.user.id);
+    const user = await findUserById(req.user.id);
     if (!(await verifyPassword(password, user.password_hash))) {
-      audit({ userId: user.id, event: 'account_delete', status: 'denied', ip: clientIp(req) });
+      await audit({ userId: user.id, event: 'account_delete', status: 'denied', ip: clientIp(req) });
       return res.status(403).json({ error: 'Password confirmation failed.' });
     }
-    audit({ userId: null, email: user.email, event: 'account_delete', status: 'ok', ip: clientIp(req) });
-    run('DELETE FROM users WHERE id = ?', user.id); // cascades to all user data
+    await audit({ userId: null, email: user.email, event: 'account_delete', status: 'ok', ip: clientIp(req) });
+    await run('DELETE FROM users WHERE id = ?', user.id); // cascades to all user data
     res.setHeader('Set-Cookie', clearCookieHeader());
     return res.json({ ok: true });
   } catch (error) {
@@ -268,12 +268,12 @@ authRouter.delete('/account', requireUser, async (req, res, next) => {
 });
 
 /* ------------------------------ settings -------------------------- */
-authRouter.put('/settings', requireUser, (req, res) => {
+authRouter.put('/settings', requireUser, async (req, res) => {
   const patch = req.body || {};
   if (patch.provider && !availableProviders().some((p) => p.id === patch.provider)) {
     return res.status(400).json({ error: `Provider "${patch.provider}" is not configured on this server.` });
   }
-  const saved = saveSettings(req.user.id, patch);
+  const saved = await saveSettings(req.user.id, patch);
   res.json({ settings: saved });
 });
 

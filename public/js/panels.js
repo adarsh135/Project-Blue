@@ -369,6 +369,10 @@ export function renderSettings() {
   }
   if ($('#set-model')) $('#set-model').value = settings.model || '';
   if ($('#model-input')) $('#model-input').value = settings.model || '';
+  const modeSelect = $('#mode-select');
+  if (modeSelect) modeSelect.value = settings.mode || 'auto';
+  const modeNames = { auto: 'Adapt to my request', reasoning: 'Plan, assumptions and checks', research: 'Multi-query sources and citations', coding: 'Runnable code and tests', planning: 'Milestones, risks and options', writing: 'Audience-aware polished prose' };
+  if ($('#mode-hint')) $('#mode-hint').textContent = modeNames[settings.mode || 'auto'] || modeNames.auto;
   if ($('#set-temp')) {
     $('#set-temp').value = settings.temperature ?? 0.7;
     $('#temp-value').textContent = Number(settings.temperature ?? 0.7).toFixed(2);

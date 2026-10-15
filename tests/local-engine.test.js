@@ -77,6 +77,30 @@ test('engine: synthesises answers from tool output and cites sources', async () 
   assert.match(text, /tavily/);
 });
 
+test('engine: deep research synthesis turns multi-query evidence into linked citations', async () => {
+  const messages = [
+    { role: 'user', content: 'research hosted SQLite alternatives' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'research_1', name: 'deep_research', args: {} }] },
+    {
+      role: 'tool',
+      name: 'deep_research',
+      tool_call_id: 'research_1',
+      content: JSON.stringify({
+        __tool: 'deep_research',
+        ok: true,
+        topic: 'hosted SQLite alternatives',
+        queries: ['hosted SQLite alternatives', 'Neon serverless PostgreSQL'],
+        sources: [{ title: 'Neon Docs', url: 'https://neon.tech/docs', query: 'Neon serverless PostgreSQL', snippet: 'Serverless Postgres.' }],
+        failures: [],
+      }),
+    },
+  ];
+  const { text } = await collect(messages);
+  assert.match(text, /Research brief: hosted SQLite alternatives/);
+  assert.match(text, /searched 2 focused queries/);
+  assert.match(text, /\[Neon Docs\]\(https:\/\/neon\.tech\/docs\)/);
+});
+
 test('engine: only uses the tool results from the current turn', async () => {
   const old = {
     role: 'tool',
@@ -135,8 +159,8 @@ test('engine: memory write path stores under a sensible key', async () => {
   });
   assert.match(text, /stack/);
   const { listMemories, forgetMemory } = await import('../server/db.js');
-  const stored = listMemories(user.id).find((m) => m.key === 'stack');
+  const stored = (await listMemories(user.id)).find((m) => m.key === 'stack');
   assert.ok(stored);
   assert.equal(stored.value, 'my stack is Node + SQLite');
-  forgetMemory(user.id, stored.id);
+  await forgetMemory(user.id, stored.id);
 });

@@ -145,17 +145,42 @@ test('sending a message streams an answer into the transcript', async () => {
   await waitFor(() => !/New chat/.test(document.querySelector('#topbar-title').textContent), { label: 'derived title' });
 });
 
+test('CSV attachment picker, chip removal lifecycle and analysis rendering work in the browser UI', async () => {
+  const chat = await import('../public/js/chat.js');
+  document.querySelector('#new-chat').click();
+  await waitFor(() => document.querySelector('#welcome'), { label: 'fresh chat for attachment' });
+
+  await chat.addFiles([new window.File(['discard me'], 'discard.txt', { type: 'text/plain' })]);
+  document.querySelector('#attachment-list .attachment-chip button').click();
+  assert.equal(document.querySelector('#attachment-list').children.length, 0, 'removed files leave the pending list');
+
+  const file = new window.File(['region,revenue\nEast,10\nWest,20'], 'sales.csv', { type: 'text/csv' });
+  await chat.addFiles([file]);
+  assert.match(document.querySelector('#attachment-list').textContent, /sales\.csv/);
+  assert.equal(document.querySelector('#attachment-list .attachment-chip button').getAttribute('aria-label'), 'Remove sales.csv');
+
+  document.querySelector('#send-btn').click();
+  await waitFor(() => document.querySelector('.msg.assistant .tool-card .name')?.textContent === 'data_analysis', { label: 'CSV tool card' });
+  await waitFor(() => [...document.querySelectorAll('.msg.assistant .msg-body.md')].some((body) => body.textContent.includes('CSV analysis: sales.csv')), { label: 'CSV summary' });
+  assert.match(document.querySelector('.msg.user .msg-attachments').textContent, /sales\.csv/);
+  assert.equal(document.querySelector('#attachment-list').children.length, 0, 'sent attachments leave the pending list');
+});
+
 test('the conversation appears in the sidebar and reopens with its history', async () => {
-  await waitFor(() => document.querySelectorAll('#conv-list .conv-item').length === 1, { label: 'conversation list' });
-  const item = document.querySelector('#conv-list .conv-item');
-  assert.ok(item.classList.contains('active'));
-  assert.match(item.querySelector('.t').textContent, /Calc 21/);
+  await waitFor(() => document.querySelectorAll('#conv-list .conv-item').length >= 2, { label: 'conversation list' });
+  const item = [...document.querySelectorAll('#conv-list .conv-item')].find((candidate) => /Calc 21/.test(candidate.querySelector('.t').textContent));
+  assert.ok(item, 'the earlier calculator conversation remains in the sidebar');
+  item.click();
+  await waitFor(() => [...document.querySelectorAll('#conv-list .conv-item')]
+    .some((candidate) => /Calc 21/.test(candidate.querySelector('.t').textContent) && candidate.classList.contains('active')), { label: 'active conversation' });
 
   // open a second chat, then come back to the first
   document.querySelector('#new-chat').click();
   await waitFor(() => document.querySelector('#welcome'), { label: 'fresh chat view' });
 
-  document.querySelector('#conv-list .conv-item').click();
+  [...document.querySelectorAll('#conv-list .conv-item')]
+    .find((candidate) => /Calc 21/.test(candidate.querySelector('.t').textContent))
+    ?.click();
   await waitFor(() => document.querySelectorAll('#messages-inner .msg').length >= 2, { label: 'restored transcript' });
   assert.match(document.querySelector('#messages-inner').textContent, /21 \* 2/);
 

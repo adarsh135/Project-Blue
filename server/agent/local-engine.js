@@ -1,4 +1,4 @@
-import { rememberMemory, listMemories, recentSearches, all } from '../db.js';
+import { rememberMemory, listMemories, recentSearches } from '../db.js';
 import { truncate } from '../lib/util.js';
 import { evaluateExpression, prettyNumber } from './math.js';
 
@@ -79,6 +79,11 @@ export function detectIntent(text) {
   // calculator
   const calcMatch = /^(?:what(?:'s| is)\s+)?(?:calc(?:ulate)?\s*:?\s*)?(.+)$/i.exec(raw);
   if (calcMatch && looksLikeMath(calcMatch[1])) return { kind: 'calculator', expression: cleanExpression(calcMatch[1]) };
+
+  // Deep research uses several focused queries and keeps the source trail.
+  if (/\bdeep research\b|\bresearch brief\b|\bliterature review\b|\bcomprehensive report\b|\binvestigate\b|\bcompare .{0,80}sources\b/i.test(raw) || /^research\b/i.test(raw)) {
+    return { kind: 'deep_research', topic: extractQuery(raw) };
+  }
 
   // web search
   const explicit = SEARCH_VERBS.test(raw) || SEARCH_TARGET.test(raw) && /\b(search|look up|find)\b/i.test(raw);
@@ -183,6 +188,29 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
     if (text) yield { type: 'text', text };
   })();
 
+  const attachments = lastUserMessage(messages)?.attachments || [];
+  const csv = attachments.find((attachment) => String(attachment.name || '').toLowerCase().endsWith('.csv'));
+  if (csv) {
+    if (!toolNames.has('data_analysis')) {
+      yield* streamText('CSV analysis is switched off in Settings → Tools. Enable `data_analysis` and ask again.');
+      yield { type: 'end', finishReason: 'stop' };
+      return;
+    }
+    yield* emitTool('data_analysis', { file_name: csv.name }, `_Analyzing ${csv.name} safely…_`);
+    yield { type: 'end', finishReason: 'tool_calls' };
+    return;
+  }
+  if (attachments.some((attachment) => attachment.kind !== 'text')) {
+    yield* streamText('The offline Blue Local Engine cannot inspect images, PDFs, audio, or video. Select a connected multimodal provider (Gemini supports these formats; OpenAI-compatible models and Ollama support images; Anthropic supports images and PDFs).');
+    yield { type: 'end', finishReason: 'stop' };
+    return;
+  }
+  if (attachments.length) {
+    yield* streamText('I can store text, code and document attachments with your chat, but the offline planner cannot summarize arbitrary files. Select a connected model to analyze them; CSV statistics remain available with the `data_analysis` tool.');
+    yield { type: 'end', finishReason: 'stop' };
+    return;
+  }
+
   switch (intent.kind) {
     case 'greeting': {
       const name = context.user?.name?.split(' ')[0];
@@ -204,8 +232,10 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
           "I'm **Blue** — the assistant built into Project Blue. Think of me as a self-hosted agentic assistant in the same mould as Arena's Agent Mode:",
           '',
           '- **Credentials & sessions** — you sign in with an account, and every chat, search and memory is scoped to your account. Sessions can be listed and revoked, and machine clients can use `blue_sk_…` API keys.',
-          '- **Agent loop with tools** — I decide when to search the web, fetch a page, calculate, check the clock, save a memory, or search your own history.',
-          '- **Recent searches** — every search I run is recorded per user, so the query history stays yours.',
+          '- **Agent loop with tools** — web research with source links, page reading, exact maths, CSV statistics, timezone lookup, memory and chat-history search.',
+          '- **Multimodal input** — connected providers can inspect images; Gemini also accepts PDFs, audio and video. Text, CSV and code files can be attached directly.',
+          '- **Persistent memory** — account-scoped facts, plus **Recent searches** saved per user across chats.',
+          '- **Work modes** — reasoning summaries, research, coding, planning and writing guidance. I provide concise explanations, not private chain-of-thought.',
           '',
           `Right now I'm answering from the **offline Blue Local Engine** (\`${LOCAL_MODEL}\`), which runs with no API key at all. Add \`OPENAI_API_KEY\`, \`ANTHROPIC_API_KEY\`, \`GEMINI_API_KEY\` or \`OLLAMA_BASE_URL\` to \`.env\` and I'll route through that model while keeping the exact same auth, sessions, memory and search plumbing.`,
         ].join('\n'),
@@ -220,8 +250,9 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
           '',
           '| Tool | What it gives you |',
           '| --- | --- |',
-          '| 🔎 `web_search` | Live web results, keyless by default, sharper with a search API key |',
-          '| 📄 `fetch_page` | Full readable text of any URL |',
+          '| 🔎 `web_search` / `deep_research` | Current results, multi-query research, source links and saved search history |',
+          '| 📄 `fetch_page` | Readable text from public web pages |',
+          '| 📊 `data_analysis` | CSV statistics, missing values and grouped chart data |',
           '| 🧮 `calculator` | Exact arithmetic — no guessing at numbers |',
           '| 🕒 `clock` | Current time in any timezone |',
           '| 🧠 `memory` | Durable facts about you, stored in your account |',
@@ -239,6 +270,17 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
       );
       yield { type: 'end', finishReason: 'stop' };
       return;
+
+    case 'deep_research': {
+      if (!toolNames.has('deep_research')) {
+        yield* streamText('The `deep_research` tool is disabled. Enable it in Settings → Tools, or ask for a single web search.');
+        yield { type: 'end', finishReason: 'stop' };
+        return;
+      }
+      yield* emitTool('deep_research', { topic: intent.topic, aspects: [] }, `_Researching "${intent.topic}" across several searches…_`);
+      yield { type: 'end', finishReason: 'tool_calls' };
+      return;
+    }
 
     case 'search_history': {
       if (!toolNames.has('search_history')) {
@@ -269,7 +311,7 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
         return;
       }
       const key = inferMemoryKey(intent.value, intent.auto);
-      rememberMemory(context.userId, key, intent.value, 'agent');
+      await rememberMemory(context.userId, key, intent.value, 'agent');
       yield* streamText(`Noted — saved under **${key}** in your account memory:\n\n> ${intent.value}`);
       yield { type: 'end', finishReason: 'stop' };
       return;
@@ -321,7 +363,7 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
     }
 
     default: {
-      yield* streamText(generalAnswer(userText, context, toolNames));
+      yield* streamText(await generalAnswer(userText, context, toolNames));
       yield { type: 'end', finishReason: 'stop' };
     }
   }
@@ -342,7 +384,9 @@ function synthesize(toolMessages, toolNames) {
       const hints = {
         web_search:
           'No search provider answered. Keyless DuckDuckGo works from most networks; for anything stricter add `TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY` to `.env` and restart the server.',
+        deep_research: 'Check the web-search provider configuration, then retry with a narrower question.',
         fetch_page: 'Check the URL is public and reachable from the server running Blue.',
+        data_analysis: 'Attach a valid CSV file under 600 KB and ensure data_analysis is enabled.',
         memory: 'That memory action failed — the key is probably missing.',
         session_search: 'That history lookup failed.',
         search_history: 'Reading your search log failed.',
@@ -362,6 +406,36 @@ function synthesize(toolMessages, toolNames) {
     }
     if (payload.__tool === 'web_search' && payload.ok) {
       blocks.push(searchResultAnswer(payload.query, payload.results, payload.provider));
+    } else if (payload.__tool === 'deep_research' && payload.ok) {
+      blocks.push([
+        `## Research brief: ${payload.topic}`,
+        '',
+        `I searched ${payload.queries.length} focused queries and found ${payload.sources.length} unique source(s). Treat snippets as leads and verify important claims on the linked pages.`,
+        '',
+        ...payload.sources.map((source, index) => `${index + 1}. [${source.title || source.url}](${source.url}) — ${truncate(source.snippet || 'No snippet provided.', 280)}\n   _Search: ${source.query}_`),
+      ].join('\n'));
+    } else if (payload.__tool === 'data_analysis' && payload.ok) {
+      const header = '| Column | Type | Missing | Unique | Min | Max | Mean |';
+      const separator = '| --- | --- | ---: | ---: | ---: | ---: | ---: |';
+      const rows = payload.columns.map((column) =>
+        `| ${column.name.replace(/\|/g, '\\|')} | ${column.type} | ${column.missing} | ${column.unique} | ${column.min ?? '—'} | ${column.max ?? '—'} | ${column.mean ?? '—'} |`,
+      );
+      const chartRows = payload.chart?.series?.map((item) => `- ${item.label}: **${item.value}**`) || [];
+      blocks.push([
+        `## CSV analysis: ${payload.file_name}`,
+        '',
+        `Analyzed **${payload.row_count} rows**. The values below come from deterministic local parsing and summary statistics.`,
+        '',
+        header,
+        separator,
+        ...rows,
+        ...(payload.chart ? ['', `### Grouped ${payload.chart.operation} by ${payload.chart.group_by}`, ...chartRows] : []),
+        '',
+        'Sample rows:',
+        '```json',
+        JSON.stringify(payload.sample, null, 2),
+        '```',
+      ].join('\n'));
     } else if (payload.__tool === 'fetch_page' && payload.ok) {
       blocks.push(
         [
@@ -430,11 +504,11 @@ function synthesize(toolMessages, toolNames) {
   return blocks.join('\n\n---\n\n');
 }
 
-function generalAnswer(text, context, toolNames) {
+async function generalAnswer(text, context, toolNames) {
   const topic = truncate(String(text).trim(), 160);
   const isQuestion = /\?\s*$/.test(String(text).trim()) || /^(how|why|what|when|where|which|who|can|should|do|does|is|are)\b/i.test(text.trim());
-  const memories = listMemories(context.userId).slice(0, 6);
-  const searches = recentSearches(context.userId, { limit: 4 });
+  const memories = (await listMemories(context.userId)).slice(0, 6);
+  const searches = await recentSearches(context.userId, { limit: 4 });
 
   const parts = [];
 

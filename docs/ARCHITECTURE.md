@@ -1,7 +1,6 @@
 # Project Blue — architecture
 
-Everything here is one Node process and one SQLite file. No build step, no bundler, no
-external services required.
+The app has one Express 5 application shared by the standalone Node server and the Vercel Node.js Function. Local installs use SQLite; serverless production uses Neon/Postgres because Vercel function filesystems are ephemeral. No frontend build or bundler is required.
 
 ---
 
@@ -13,7 +12,7 @@ users ─┬─ credentials   (kind: password | api_key)   ── hashed secrets
        ├─ chat_sessions (conversations) ── messages (user | assistant | tool)
        ├─ searches      (recent searches, per user)
        ├─ memories      (durable key/value facts)
-       ├─ settings      (provider, model, temperature, tools, theme)
+       ├─ settings      (provider, model, work mode, temperature, tools, theme)
        └─ auth_events   (credential audit log)
 ```
 
@@ -25,14 +24,12 @@ Key columns:
 | `credentials` | `kind`, `prefix`, `secret_hash` (SHA-256), `scopes`, `revoked_at`, `last_used_at` |
 | `sessions` | `token_hash` (SHA-256 of `sessionId.secret`), `user_agent`, `ip`, `expires_at`, `revoked_at` |
 | `chat_sessions` | `title`, `provider`, `model`, `pinned`, `archived`, `updated_at` |
-| `messages` | `role`, `name`, `tool_call_id`, `content`, `tool_calls` (JSON), `tokens_in/out`, `latency_ms` |
+| `messages` | `role`, `name`, `tool_call_id`, `content`, `tool_calls` (JSON), `attachments` (JSON), `tokens_in/out`, `latency_ms` |
 | `searches` | `query`, `provider`, `result_count`, `results` (JSON), `source` (`agent`\|`user`), `pinned` |
 | `memories` | unique `(user_id, key)` → `value`, `source` (`agent`\|`user`) |
 | `auth_events` | `event`, `status`, `ip`, `user_agent`, `detail` |
 
-SQLite pragmas: `journal_mode=WAL`, `foreign_keys=ON`. Deleting a user cascades to every
-row they own. Additive migrations run at boot (`migrate()` in `db.js`), so an older
-database keeps working.
+SQLite uses `journal_mode=WAL` and `foreign_keys=ON`. Hosted Postgres DDL/migrations run once per function cold start; all queries await the shared database-ready promise. Deleting a user cascades to every row they own. Additive migrations keep existing local databases working.
 
 ---
 
@@ -96,7 +93,7 @@ POST /api/sessions/:id/messages   { content }
         │
         ├─ persist user message ─────────────► messages(role=user)
         ├─ title derived from first message ─► chat_sessions.title
-        ├─ context = system prompt + memories + 8 recent searches + ≤400 messages
+        ├─ context = system prompt + memories + 8 recent searches + bounded history (160 messages / 240k chars by default)
         │
         └─ loop (≤ BLUE_MAX_TOOL_ROUNDS)
               ┌─────────────────────────────────────────────────────────────┐
@@ -132,6 +129,22 @@ gets an answer, and the persisted message records which provider actually answer
 Each adapter converts the shared message format (`system` + `user`/`assistant`/`tool` with
 `tool_calls` and `tool_call_id`) into its own dialect.
 
+### Attachments and data analysis
+
+The chat route validates up to three inline attachments before persisting them with the user
+message. Per-file, total-binary, text and serialized-request limits are enforced. Text/code/CSV
+is passed as labeled untrusted text; binary payloads are serialized by modality. The current
+adapters accept text and images for OpenAI-compatible APIs and Ollama, text/images/PDF for
+Anthropic, and text/images/PDF/audio/video for Gemini. Unsupported combinations fail with a
+provider-specific message instead of silently dropping files. Older media is omitted from
+provider context after a bounded number of recent binary files, while the saved attachment
+metadata remains in chat history.
+
+`data_analysis` parses CSV without executing uploaded code and returns deterministic column
+summaries, missing-value counts, numeric statistics and optional grouped series for charting.
+The local engine can analyze CSVs offline; it explicitly declines to summarize arbitrary media
+or documents without a connected model.
+
 ### The offline engine
 
 `local-engine.js` implements the same generator contract without any network call:
@@ -153,7 +166,9 @@ configure instead.
 | tool | notes |
 | --- | --- |
 | `web_search` | Tavily → Brave → Serper → keyless DuckDuckGo (Instant Answer + HTML fallback); every attempt is recorded in `searches`, including failures (`provider: 'unavailable'`) |
+| `deep_research` | several focused web searches; deduplicated sources and source-linked research brief |
 | `fetch_page` | 12s timeout, HTML→readable text, capped at 40k chars |
+| `data_analysis` | local CSV parsing, missing/numeric summaries and optional grouped chart series |
 | `calculator` | recursive-descent parser: `+ - * / % ^`, functions, constants; no `eval`; thousands separators supported |
 | `clock` | `Intl.DateTimeFormat` with a validated IANA timezone |
 | `memory` | `save` / `recall` / `forget` against the `memories` table |
@@ -194,11 +209,12 @@ No framework, no build. `public/js/*.js` are native ES modules driven by a tiny 
 (`store.js`):
 
 * `app.js` — boot, auth forms, view routing, wiring every control, subscribes to bus events
-* `chat.js` — transcript rendering (history + live stream), tool cards, stop/regenerate
-* `panels.js` — conversation list, recent searches (view + rail), memory, tools, settings, account
+* `chat.js` — transcript rendering (history + live stream), attachments, tool cards, stop/regenerate
+* `panels.js` — conversation list, recent searches (view + rail), memory, tools, modes, settings, account
 * `api.js` — fetch wrapper (cookies + `x-blue-csrf`) and the SSE frame reader
 * `markdown.js` — escape-first markdown renderer (headings, lists, tables, blockquotes,
-  fenced code with copy buttons, autolinks) — safe by construction
+  copyable code and autolinks); HTML fences render in a static sandboxed preview with scripts,
+  links and external requests disabled
 * `ui.js` — element helpers, toasts, modals, relative time, theme
 
 Streaming renders into a *new* `.msg-body` per text segment with tool cards in between, so a
@@ -209,9 +225,8 @@ merged blob.
 
 ## 6. Operational notes
 
-* One process serves the API and the assets. `GET /api/status` is public and reports uptime,
-  configured providers and search backends for health checks.
-* Back up `data/blue.db` (plus `-wal`/`-shm` while running) and `data/.session-secret`.
-* `BLUE_SEARCH_OFFLINE=true` makes Blue fully air-gapped; `BLUE_FORCE_LOCAL_ENGINE=true`
-  guarantees no outbound model calls.
-* The rate limiter is in-process; put a reverse proxy in front for multi-instance deploys.
+* The local server is one process; Vercel exports the same Express app as a Node.js Function. `GET /api/status` reports configured providers, database kind and search backends.
+* Back up local `data/blue.db` (plus `-wal`/`-shm` while running) and `data/.session-secret`. For Vercel, use Neon/Postgres backups; function filesystems are ephemeral.
+* `BLUE_SEARCH_OFFLINE=true` disables outbound search; `BLUE_FORCE_LOCAL_ENGINE=true` forces the offline planner instead of model providers.
+* Rate limits are stored atomically in the configured database, so they are shared across serverless instances. Vercel production requires Postgres and a stable 32+ character `BLUE_SESSION_SECRET`.
+* See [VERCEL.md](VERCEL.md) for Git import, preview/production environments, deployment settings and smoke checks.

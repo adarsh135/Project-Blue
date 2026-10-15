@@ -4,6 +4,112 @@ import { state, emit, currentSession } from './store.js';
 import { $, clear, el, toast, toolIcon, providerLabel } from './ui.js';
 
 const messagesInner = () => $('#messages-inner');
+let pendingAttachments = [];
+
+const TEXT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.log', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.sql', '.html', '.htm', '.css', '.xml', '.yaml', '.yml', '.toml', '.sh', '.go', '.rs', '.java', '.c', '.h', '.cpp', '.hpp', '.rb', '.php']);
+const MIME_BY_EXTENSION = { '.csv': 'text/csv', '.tsv': 'text/tab-separated-values', '.json': 'application/json', '.md': 'text/markdown', '.html': 'text/html', '.htm': 'text/html', '.js': 'text/javascript', '.ts': 'text/typescript', '.py': 'text/x-python', '.sql': 'text/plain', '.txt': 'text/plain', '.log': 'text/plain' };
+
+function queueAttachment(attachment) {
+  const textChars = pendingAttachments.reduce((sum, item) => sum + (item.kind === 'text' ? item.text.length : 0), 0) +
+    (attachment.kind === 'text' ? attachment.text.length : 0);
+  if (textChars > 800_000) {
+    toast('Combined text attachments must be under 800,000 characters.', 'err');
+    return false;
+  }
+  const payloadBytes = new Blob([JSON.stringify([...pendingAttachments, attachment])]).size;
+  if (payloadBytes > 3_500_000) {
+    toast('Combined attachment payload is too large; remove a file and try again.', 'err');
+    return false;
+  }
+  pendingAttachments.push(attachment);
+  return true;
+}
+
+export function clearPendingAttachments() {
+  pendingAttachments = [];
+  renderPendingAttachments();
+  const input = $('#attachment-input');
+  if (input) input.value = '';
+}
+
+export async function addFiles(files) {
+  for (const file of files) {
+    if (pendingAttachments.length >= 3) {
+      toast('Attach at most 3 files per message.', 'err');
+      break;
+    }
+    const name = String(file.name || 'attachment').slice(0, 128);
+    const dot = name.toLowerCase().lastIndexOf('.');
+    const extension = dot < 0 ? '' : name.toLowerCase().slice(dot);
+    const mimeType = file.type || MIME_BY_EXTENSION[extension] || 'application/octet-stream';
+    const isText = mimeType.startsWith('text/') || mimeType === 'application/json' || TEXT_EXTENSIONS.has(extension);
+    const maxBytes = isText ? 600_000 : state.limits?.maxAttachmentBytes || 2 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      toast(`${name} is too large (limit ${Math.ceil(maxBytes / 1024 / 1024)} MB).`, 'err');
+      continue;
+    }
+
+    try {
+      if (isText) {
+        const text = await file.text();
+        queueAttachment({ name, mimeType, kind: 'text', text, size: file.size });
+      } else if (['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav', 'audio/aac', 'audio/ogg', 'audio/webm', 'audio/mp4', 'video/mp4', 'video/webm', 'video/quicktime', 'application/pdf'].includes(mimeType)) {
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error('Could not read file'));
+          reader.readAsDataURL(file);
+        });
+        const binaryBytes = pendingAttachments.filter((item) => item.kind !== 'text').reduce((sum, item) => sum + (item.size || 0), 0);
+        if (binaryBytes + file.size > 2_600_000) {
+          toast('Combined image/audio/video/PDF files must be under 2.6 MB per message.', 'err');
+          continue;
+        }
+        queueAttachment({ name, mimeType, kind: mimeType.startsWith('image/') ? 'image' : 'media', data, size: file.size });
+      } else {
+        toast(`${name} has an unsupported file type.`, 'err');
+      }
+    } catch (error) {
+      toast(`${name}: ${error.message || 'could not read file'}`, 'err');
+    }
+  }
+  renderPendingAttachments();
+}
+
+function iconForAttachment(attachment) {
+  if (attachment.kind === 'image' || attachment.mimeType?.startsWith('image/')) return '🖼';
+  if (attachment.mimeType?.startsWith('audio/')) return '🎧';
+  if (attachment.mimeType?.startsWith('video/')) return '🎬';
+  if (attachment.mimeType === 'application/pdf') return '📕';
+  return String(attachment.name || '').toLowerCase().endsWith('.csv') ? '📊' : '📄';
+}
+
+function renderPendingAttachments() {
+  const list = clear($('#attachment-list'));
+  for (const [index, attachment] of pendingAttachments.entries()) {
+    list.append(el('span', { class: 'attachment-chip' }, [
+      iconForAttachment(attachment),
+      el('span', { class: 'filename', title: attachment.name, text: attachment.name }),
+      el('button', { type: 'button', title: 'Remove attachment', 'aria-label': `Remove ${attachment.name}`, text: '×', onclick: () => {
+        pendingAttachments.splice(index, 1);
+        renderPendingAttachments();
+      } }),
+    ]));
+  }
+}
+
+function renderMessageAttachments(container, attachments = []) {
+  if (!attachments?.length) return;
+  const list = el('div', { class: 'msg-attachments' });
+  for (const attachment of attachments) {
+    list.append(el('span', { class: 'attachment-chip', title: attachment.mimeType || '' }, [
+      iconForAttachment(attachment),
+      el('span', { class: 'filename', text: attachment.name || 'attachment' }),
+    ]));
+  }
+  container.append(list);
+}
+
 const scrollToBottom = (force = false) => {
   const box = $('#messages');
   if (!box) return;
@@ -79,19 +185,50 @@ function fillToolBody(body, name, payload, summary, status) {
     body.append(el('div', { class: 'small', style: 'color:var(--err)', text: payload.error || 'failed' }));
     return;
   }
-  if (name === 'web_search' && payload.results) {
+  if ((name === 'web_search' && payload.results) || (name === 'deep_research' && payload.sources)) {
     const list = el('div', { class: 'result-list' });
     if (payload.answer) list.append(el('div', { class: 'small muted', text: payload.answer }));
-    for (const [index, r] of payload.results.entries()) {
+    const results = name === 'deep_research' ? payload.sources : payload.results;
+    for (const [index, result] of results.entries()) {
       list.append(
-        el('a', { class: 'result', href: r.url, target: '_blank', rel: 'noopener noreferrer' }, [
-          el('b', { text: `${index + 1}. ${r.title || r.url}` }),
-          el('span', { text: r.snippet || '' }),
-          el('code', { text: r.url }),
+        el('a', { class: 'result', href: result.url, target: '_blank', rel: 'noopener noreferrer' }, [
+          el('b', { text: `${index + 1}. ${result.title || result.url}` }),
+          el('span', { text: result.snippet || '' }),
+          el('code', { text: result.url }),
         ]),
       );
     }
     body.append(list);
+    return;
+  }
+  if (name === 'data_analysis' && payload.columns) {
+    body.append(el('div', { class: 'small muted', text: `${payload.row_count} rows · ${payload.file_name}` }));
+    const table = el('table', { class: 'table' });
+    table.append(el('thead', {}, [el('tr', {}, ['Column', 'Type', 'Missing', 'Min', 'Max', 'Mean'].map((label) => el('th', { text: label })))]));
+    const tbody = el('tbody');
+    for (const column of payload.columns) {
+      tbody.append(el('tr', {}, [
+        el('td', { text: column.name }), el('td', { text: column.type }), el('td', { text: String(column.missing) }),
+        el('td', { text: column.min === undefined ? '—' : String(column.min) }),
+        el('td', { text: column.max === undefined ? '—' : String(column.max) }),
+        el('td', { text: column.mean === undefined ? '—' : String(column.mean) }),
+      ]));
+    }
+    table.append(tbody);
+    body.append(table);
+    if (payload.chart?.series?.length) {
+      const chart = el('div', { class: 'csv-chart', role: 'img', 'aria-label': `Grouped ${payload.chart.operation} by ${payload.chart.group_by}` });
+      const max = Math.max(...payload.chart.series.map((item) => Number(item.value) || 0), 1);
+      for (const item of payload.chart.series) {
+        const row = el('div', { class: 'csv-bar-row' }, [
+          el('span', { class: 'csv-bar-label', title: item.label, text: item.label }),
+          el('span', { class: 'csv-bar-track' }, [el('span', { class: 'csv-bar-fill', style: `width:${Math.max(2, (Number(item.value) / max) * 100)}%` })]),
+          el('span', { class: 'csv-bar-value', text: String(item.value) }),
+        ]);
+        chart.append(row);
+      }
+      body.append(chart);
+    }
     return;
   }
   const text = payload.text || payload.formatted || payload.result || payload.excerpt;
@@ -149,6 +286,7 @@ export function renderHistory(messages) {
       }
       if (!parts.length) continue;
     } else {
+      renderMessageAttachments(bubble, row.attachments);
       renderInto(body, row.content);
     }
     addMessageActions(node, row);
@@ -173,6 +311,16 @@ function addMessageActions(node, row) {
         },
       }),
     );
+    if (window.speechSynthesis && (window.SpeechSynthesisUtterance || globalThis.SpeechSynthesisUtterance)) {
+      actions.append(el('button', {
+        text: '🔊 Read aloud',
+        onclick: () => {
+          window.speechSynthesis.cancel();
+          const Utterance = window.SpeechSynthesisUtterance || globalThis.SpeechSynthesisUtterance;
+          window.speechSynthesis.speak(new Utterance(String(row.content).replace(/[`*_#>]/g, ' ')));
+        },
+      }));
+    }
   }
   if (row.latency_ms) {
     actions.append(el('span', { class: 'muted small', text: `${row.latency_ms} ms · ${row.model || ''}` }));
@@ -229,23 +377,30 @@ export async function ensureSession() {
 }
 
 export async function sendTurn(text) {
-  const content = String(text || '').trim();
-  if (!content || state.streaming) return;
+  let content = String(text || '').trim();
+  if (state.streaming) return;
+  const attachments = [...pendingAttachments];
+  if (!content && !attachments.length) return;
+  if (!content) content = `Please analyze the attached file${attachments.length === 1 ? '' : 's'}: ${attachments.map((file) => file.name).join(', ')}`;
 
   const input = $('#input');
   if (input) {
     input.value = '';
     input.style.height = 'auto';
   }
+  pendingAttachments = [];
+  renderPendingAttachments();
+  const publicAttachments = attachments.map(({ name, mimeType, kind, size }) => ({ name, mimeType, kind, size }));
 
   const inner = messagesInner();
   $('#welcome')?.remove();
 
   // optimistic user bubble
-  const { node: userNode, body: userBody } = messageNode('user');
+  const { node: userNode, body: userBody, bubble: userBubble } = messageNode('user');
+  renderMessageAttachments(userBubble, publicAttachments);
   renderInto(userBody, content);
   inner.append(userNode);
-  state.messages.push({ id: `local_${Date.now()}`, role: 'user', content, created_at: new Date().toISOString() });
+  state.messages.push({ id: `local_${Date.now()}`, role: 'user', content, attachments: publicAttachments, created_at: new Date().toISOString() });
   scrollToBottom(true);
 
   state.streaming = true;
@@ -273,7 +428,7 @@ export async function sendTurn(text) {
     const sessionId = await ensureSession();
     await streamChat(
       sessionId,
-      { content },
+      { content, attachments, mode: state.settings?.mode || 'auto' },
       {
         signal: controller.signal,
         onEvent: (event) => {
@@ -352,6 +507,10 @@ export async function sendTurn(text) {
     );
   } catch (error) {
     failed = true;
+    if (error.name !== 'AbortError' && attachments.length) {
+      pendingAttachments = attachments;
+      renderPendingAttachments();
+    }
     if (error.name !== 'AbortError') {
       typing.remove();
       bubble.append(

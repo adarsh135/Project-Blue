@@ -64,7 +64,7 @@ class Client {
   }
 
   /** POST a chat turn and collect the SSE events. */
-  async chatTurn(sessionId, content) {
+  async chatTurn(sessionId, content, extra = {}) {
     const res = await fetch(`${base}/api/sessions/${sessionId}/messages`, {
       method: 'POST',
       headers: {
@@ -72,7 +72,7 @@ class Client {
         cookie: this.cookieHeader(),
         'x-blue-csrf': this.cookies.blue_csrf,
       },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, ...extra }),
     });
     assert.equal(res.status, 200);
     const raw = await res.text();
@@ -383,6 +383,38 @@ test('one user cannot read another user\'s chats, searches or memories', async (
 
   const bobEvents = await bob.request('/api/auth/events');
   assert.ok(bobEvents.data.events.every((e) => e.event !== 'api_key_create'));
+});
+
+test('CSV attachments run local data analysis, retain safe metadata and save work modes', async () => {
+  const client = new Client();
+  await client.request('/api/auth/register', {
+    method: 'POST',
+    body: { email: 'csv-user@example.com', password: 'CsvPass2026!' },
+  });
+  const saved = await client.request('/api/settings', { method: 'PUT', body: { mode: 'research' } });
+  assert.equal(saved.data.settings.mode, 'research');
+
+  const sessionId = (await client.request('/api/sessions', { method: 'POST', body: { title: 'CSV test' } })).data.session.id;
+  const turn = await client.chatTurn(sessionId, 'Please analyze the attached sales data.', {
+    attachments: [{ name: 'sales.csv', mimeType: 'text/csv', text: 'region,revenue\nEast,10\nWest,20\nEast,30' }],
+  });
+  assert.ok(turn.toolCalls.some((call) => call.name === 'data_analysis'));
+  assert.match(turn.text, /CSV analysis: sales\.csv/);
+  assert.match(turn.text, /\*\*3 rows\*\*/);
+  assert.match(turn.text, /\| revenue \| number \| 0 \| 3 \| 10 \| 30 \| 20 \|/);
+
+  const detail = await client.request(`/api/sessions/${sessionId}`);
+  const userMessage = detail.data.messages.find((message) => message.role === 'user');
+  assert.equal(userMessage.attachments[0].name, 'sales.csv');
+  assert.equal(userMessage.attachments[0].kind, 'text');
+  assert.equal(userMessage.attachments[0].size, Buffer.byteLength('region,revenue\nEast,10\nWest,20\nEast,30'));
+  assert.equal(Object.hasOwn(userMessage.attachments[0], 'text'), false);
+
+  const invalid = await client.request(`/api/sessions/${sessionId}/messages`, {
+    method: 'POST',
+    body: { content: 'inspect this', attachments: [{ name: 'malware.exe', mimeType: 'application/octet-stream', data: 'AAAA' }] },
+  });
+  assert.equal(invalid.status, 400);
 });
 
 test('settings drive the provider, model and enabled tools', async () => {

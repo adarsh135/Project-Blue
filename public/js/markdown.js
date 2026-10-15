@@ -46,8 +46,11 @@ export function renderMarkdown(source) {
   // 1. pull out fenced code
   const withSlots = text.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     const language = (lang || '').toLowerCase();
+    const preview = ['html', 'htm', 'html5'].includes(language)
+      ? `<button class="preview-btn" type="button" data-preview="${escapeHtml(code)}">Preview</button>`
+      : '';
     codeBlocks.push(
-      `<div class="code-wrap"><button class="copy-btn" data-copy="${escapeHtml(code)}">copy</button>` +
+      `<div class="code-wrap"><div class="code-actions">${preview}<button class="copy-btn" type="button" data-copy="${escapeHtml(code)}">copy</button></div>` +
         `<pre><code data-lang="${escapeHtml(language)}">${escapeHtml(code.replace(/\n$/, ''))}</code></pre></div>`,
     );
     return `\n${CODE_SLOT}${codeBlocks.length - 1}${CODE_SLOT}\n`;
@@ -178,6 +181,33 @@ export function renderInto(element, markdown) {
       } catch {
         button.textContent = 'failed';
       }
+    });
+  }
+  for (const button of element.querySelectorAll('.preview-btn')) {
+    button.addEventListener('click', () => {
+      const wrapper = button.closest('.code-wrap');
+      let preview = wrapper.querySelector('.artifact-preview');
+      if (preview) {
+        preview.remove();
+        button.textContent = 'Preview';
+        return;
+      }
+      preview = element.ownerDocument.createElement('div');
+      preview.className = 'artifact-preview';
+      const frame = element.ownerDocument.createElement('iframe');
+      frame.setAttribute('sandbox', '');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.setAttribute('title', 'Sandboxed HTML artifact preview');
+      frame.setAttribute('loading', 'lazy');
+      const policy = "default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline' data:; script-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'";
+      const artifact = String(button.dataset.preview || '')
+        .replace(/<meta\b(?=[^>]*\bhttp-equiv\s*=\s*(?:\"refresh\"|'refresh'|refresh\b))[^>]*>/gi, '')
+        .replace(/<base\b[^>]*>/gi, '')
+        .replace(/\s(?:href|xlink:href|ping)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)/gi, '');
+      frame.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}">${artifact}`;
+      preview.append(frame);
+      wrapper.append(preview);
+      button.textContent = 'Hide preview';
     });
   }
   return element;

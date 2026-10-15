@@ -167,6 +167,21 @@
       <div class="composer">
         <div class="composer-inner">
           <div class="composer-box">
+            <div class="composer-tools">
+              <button class="btn btn-ghost btn-sm" id="attach-btn" type="button" title="Attach images, PDFs, audio/video clips, text, CSV or code">📎 Attach</button>
+              <input id="attachment-input" type="file" multiple hidden accept="image/*,audio/*,video/mp4,video/webm,video/quicktime,application/pdf,.txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.log,.js,.mjs,.ts,.tsx,.jsx,.py,.sql,.html,.css,.xml,.yaml,.yml,.toml,.sh,.go,.rs,.java,.c,.cpp,.h,.hpp,.rb,.php" />
+              <select class="select mode-select" id="mode-select" title="Assistant work mode" aria-label="Assistant work mode">
+                <option value="auto">✨ Auto</option>
+                <option value="reasoning">🧩 Reasoning</option>
+                <option value="research">🔎 Research</option>
+                <option value="coding">💻 Coding</option>
+                <option value="planning">🗺 Planning</option>
+                <option value="writing">✍️ Writing</option>
+              </select>
+              <button class="btn btn-ghost btn-sm" id="voice-btn" type="button" title="Dictate with your browser">🎙 Dictate</button>
+              <span class="mode-hint" id="mode-hint">Adapt to my request</span>
+            </div>
+            <div class="attachment-list" id="attachment-list" aria-live="polite"></div>
             <textarea id="input" rows="1" placeholder="Ask Blue anything…  (Enter to send, Shift+Enter for a new line)"></textarea>
             <div class="composer-bar">
               <div class="tool-toggles" id="tool-toggles"></div>

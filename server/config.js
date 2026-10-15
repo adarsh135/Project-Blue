@@ -28,15 +28,39 @@ function loadDotEnv() {
 }
 loadDotEnv();
 
+const env = process.env.NODE_ENV || 'development';
+const isVercel = Boolean(process.env.VERCEL);
+const databaseUrl =
+  process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_URL_NON_POOLING || '';
+const bool = (v, fallback = false) =>
+  v === undefined || v === '' ? fallback : /^(1|true|yes|on)$/i.test(String(v));
+
+if (env === 'production' && isVercel && !databaseUrl) {
+  throw new Error('Vercel production requires DATABASE_URL (or POSTGRES_URL) for durable user data.');
+}
+if (env === 'production' && isVercel && !process.env.BLUE_SESSION_SECRET) {
+  throw new Error('Vercel production requires a stable BLUE_SESSION_SECRET environment variable.');
+}
+if (env === 'production' && isVercel && String(process.env.BLUE_SESSION_SECRET || '').length < 32) {
+  throw new Error('BLUE_SESSION_SECRET must be at least 32 characters in production.');
+}
+
 export const DATA_DIR = process.env.BLUE_DATA_DIR
   ? path.resolve(process.env.BLUE_DATA_DIR)
-  : path.join(ROOT, 'data');
+  : isVercel
+    ? '/tmp/project-blue'
+    : path.join(ROOT, 'data');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// SQLite is a convenient durable-enough local/single-server default. It is
+// deliberately not used on Vercel: function filesystems are ephemeral.
+if (!databaseUrl) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-/** Stable session secret: env var wins, otherwise persisted random value. */
+/** Stable session secret: env var wins, otherwise persisted for local installs. */
 function sessionSecret() {
   if (process.env.BLUE_SESSION_SECRET) return process.env.BLUE_SESSION_SECRET;
+  if (isVercel && env === 'production') {
+    throw new Error('Set BLUE_SESSION_SECRET in the Vercel project environment.');
+  }
   const file = path.join(DATA_DIR, '.session-secret');
   if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8').trim();
   const secret = crypto.randomBytes(48).toString('base64url');
@@ -44,15 +68,15 @@ function sessionSecret() {
   return secret;
 }
 
-const bool = (v, fallback = false) =>
-  v === undefined || v === '' ? fallback : /^(1|true|yes|on)$/i.test(String(v));
-
 export const config = {
-  env: process.env.NODE_ENV || 'development',
+  env,
+  isVercel,
   host: process.env.HOST || '0.0.0.0',
   port: process.env.PORT !== undefined && process.env.PORT !== '' ? Number(process.env.PORT) : 4000,
   publicUrl: process.env.PUBLIC_URL || '',
   dataDir: DATA_DIR,
+  databaseUrl,
+  databaseKind: databaseUrl ? 'postgres' : 'sqlite',
   dbFile: process.env.BLUE_DB_FILE || path.join(DATA_DIR, 'blue.db'),
   sessionSecret: sessionSecret(),
   sessionTtlHours: Number(process.env.SESSION_TTL_HOURS || 168),
@@ -60,6 +84,10 @@ export const config = {
   // Skip every outbound search request (used by tests and air-gapped installs).
   searchOffline: bool(process.env.BLUE_SEARCH_OFFLINE),
   maxToolRounds: Number(process.env.BLUE_MAX_TOOL_ROUNDS || 4),
+  maxHistoryMessages: Math.min(Math.max(Number(process.env.BLUE_MAX_HISTORY_MESSAGES || 160), 20), 500),
+  maxContextChars: Math.min(Math.max(Number(process.env.BLUE_MAX_CONTEXT_CHARS || 240000), 20000), 1000000),
+  maxRequestBytes: 4 * 1024 * 1024,
+  maxAttachmentBytes: 2 * 1024 * 1024,
   providers: {
     openai: {
       id: 'openai',
@@ -123,12 +151,15 @@ export function defaultProviderId() {
   return 'local';
 }
 
-config.version = '1.0.0';
+config.version = '1.1.0';
 
 /** Bits of config that are safe to expose to the browser. */
 export const PUBLIC_LIMITS = {
   maxToolRounds: config.maxToolRounds,
+  maxHistoryMessages: config.maxHistoryMessages,
+  maxAttachmentBytes: config.maxAttachmentBytes,
   sessionTtlHours: config.sessionTtlHours,
+  database: config.databaseKind,
   searchProviders: {
     tavily: !!config.search.tavily,
     brave: !!config.search.brave,

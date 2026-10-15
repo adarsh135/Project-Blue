@@ -2,6 +2,7 @@ import express from 'express';
 import {
   all,
   clearSearches,
+  consumeRateLimit,
   createChatSession,
   deleteSearch,
   forgetMemory,
@@ -24,6 +25,7 @@ import { runAgent } from '../agent/agent.js';
 import { runWebSearch, toolsForEnabled, TOOL_DEFINITIONS } from '../agent/tools.js';
 import { clamp, safeJsonParse, truncate } from '../lib/util.js';
 import { titleFromMessage } from '../agent/prompt.js';
+import { normalizeAttachments, publicAttachmentMeta } from '../agent/attachments.js';
 
 export const apiRouter = express.Router();
 
@@ -33,12 +35,12 @@ apiRouter.use(requireUser);
 /* meta                                                                */
 /* ------------------------------------------------------------------ */
 
-apiRouter.get('/health', (req, res) => {
-  res.json({ ok: true, version: config.version, engine: getSettings(req.user.id).provider });
+apiRouter.get('/health', async (req, res) => {
+  res.json({ ok: true, version: config.version, engine: (await getSettings(req.user.id)).provider });
 });
 
-apiRouter.get('/tools', (req, res) => {
-  const enabled = getSettings(req.user.id).tools_enabled;
+apiRouter.get('/tools', async (req, res) => {
+  const enabled = (await getSettings(req.user.id)).tools_enabled;
   res.json({
     tools: TOOL_DEFINITIONS.map((t) => ({
       name: t.name,
@@ -69,17 +71,17 @@ const serialiseSession = (row) => ({
   updated_at: row.updated_at,
 });
 
-apiRouter.get('/sessions', (req, res) => {
-  const rows = listChatSessions(req.user.id, {
+apiRouter.get('/sessions', async (req, res) => {
+  const rows = await listChatSessions(req.user.id, {
     includeArchived: req.query.archived === '1',
     q: String(req.query.q || '').trim(),
   });
   res.json({ sessions: rows.map(serialiseSession) });
 });
 
-apiRouter.post('/sessions', (req, res) => {
-  const settings = getSettings(req.user.id);
-  const session = createChatSession(req.user.id, {
+apiRouter.post('/sessions', async (req, res) => {
+  const settings = await getSettings(req.user.id);
+  const session = await createChatSession(req.user.id, {
     title: String(req.body?.title || 'New chat').slice(0, 120),
     provider: req.body?.provider || settings.provider,
     model: req.body?.model || settings.model,
@@ -88,16 +90,17 @@ apiRouter.post('/sessions', (req, res) => {
   res.status(201).json({ session: serialiseSession(session) });
 });
 
-apiRouter.get('/sessions/:id', (req, res) => {
-  const session = getChatSession(req.user.id, req.params.id);
+apiRouter.get('/sessions/:id', async (req, res) => {
+  const session = await getChatSession(req.user.id, req.params.id);
   if (!session) return res.status(404).json({ error: 'Chat not found' });
-  const messages = listMessages(session.id, req.user.id).map((m) => ({
+  const messages = (await listMessages(session.id, req.user.id)).map((m) => ({
     id: m.id,
     role: m.role,
     name: m.name,
     // tool_call_id links a tool result back to the assistant call that made it
     tool_call_id: m.tool_call_id,
     content: m.content,
+    attachments: publicAttachmentMeta(safeJsonParse(m.attachments, [])),
     tool_calls: safeJsonParse(m.tool_calls, null),
     provider: m.provider,
     model: m.model,
@@ -109,11 +112,11 @@ apiRouter.get('/sessions/:id', (req, res) => {
   return res.json({ session: serialiseSession(session), messages });
 });
 
-apiRouter.patch('/sessions/:id', (req, res) => {
-  const session = getChatSession(req.user.id, req.params.id);
+apiRouter.patch('/sessions/:id', async (req, res) => {
+  const session = await getChatSession(req.user.id, req.params.id);
   if (!session) return res.status(404).json({ error: 'Chat not found' });
   const body = req.body || {};
-  run(
+  await run(
     `UPDATE chat_sessions SET title = ?, pinned = ?, archived = ?, provider = ?, model = ? WHERE id = ? AND user_id = ?`,
     body.title === undefined ? session.title : String(body.title).slice(0, 200),
     body.pinned === undefined ? session.pinned : body.pinned ? 1 : 0,
@@ -123,19 +126,19 @@ apiRouter.patch('/sessions/:id', (req, res) => {
     session.id,
     req.user.id,
   );
-  return res.json({ session: serialiseSession(getChatSession(req.user.id, session.id)) });
+  return res.json({ session: serialiseSession(await getChatSession(req.user.id, session.id)) });
 });
 
-apiRouter.delete('/sessions/:id', (req, res) => {
-  run('DELETE FROM chat_sessions WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
+apiRouter.delete('/sessions/:id', async (req, res) => {
+  await run('DELETE FROM chat_sessions WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
   res.json({ ok: true });
 });
 
-apiRouter.get('/sessions/:id/search', (req, res) => {
-  const session = getChatSession(req.user.id, req.params.id);
+apiRouter.get('/sessions/:id/search', async (req, res) => {
+  const session = await getChatSession(req.user.id, req.params.id);
   if (!session) return res.status(404).json({ error: 'Chat not found' });
   const q = `%${String(req.query.q || '').trim()}%`;
-  const rows = all(
+  const rows = await all(
     `SELECT id, role, content, created_at FROM messages
      WHERE chat_session_id = ? AND user_id = ? AND content LIKE ? ORDER BY created_at DESC LIMIT 50`,
     session.id,
@@ -146,10 +149,10 @@ apiRouter.get('/sessions/:id/search', (req, res) => {
 });
 
 /** Search across every conversation of the signed-in user. */
-apiRouter.get('/messages/search', (req, res) => {
+apiRouter.get('/messages/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.json({ matches: [] });
-  const rows = all(
+  const rows = await all(
     `SELECT m.id, m.chat_session_id, m.role, m.content, m.created_at, s.title
      FROM messages m JOIN chat_sessions s ON s.id = m.chat_session_id
      WHERE m.user_id = ? AND m.content LIKE ? ORDER BY m.created_at DESC LIMIT 60`,
@@ -172,34 +175,48 @@ apiRouter.get('/messages/search', (req, res) => {
 /* chat streaming                                                      */
 /* ------------------------------------------------------------------ */
 
-const streamLimiter = new Map();
 const STREAM_WINDOW_MS = 60_000;
 const STREAM_MAX = 30;
 
-function streamGuard(req, res, next) {
-  const key = req.user.id;
-  const nowMs = Date.now();
-  const hits = (streamLimiter.get(key) || []).filter((t) => nowMs - t < STREAM_WINDOW_MS);
-  if (hits.length >= STREAM_MAX) {
-    return res.status(429).json({ error: 'Too many messages per minute. Take a breath and retry shortly.' });
+async function streamGuard(req, res, next) {
+  try {
+    const { hits, windowStart } = await consumeRateLimit(`chat:${req.user.id}`, STREAM_WINDOW_MS);
+    if (hits > STREAM_MAX) {
+      const retryAfter = Math.max(1, Math.ceil((windowStart + STREAM_WINDOW_MS - Date.now()) / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: 'Too many messages per minute. Take a breath and retry shortly.', retryAfter });
+    }
+    return next();
+  } catch (error) {
+    return next(error);
   }
-  hits.push(nowMs);
-  streamLimiter.set(key, hits);
-  return next();
 }
 
 apiRouter.post('/sessions/:id/messages', requireSameOrigin, streamGuard, async (req, res) => {
-  const session = getChatSession(req.user.id, req.params.id);
+  const session = await getChatSession(req.user.id, req.params.id);
   if (!session) return res.status(404).json({ error: 'Chat not found' });
 
-  const content = String(req.body?.content || '').trim();
-  if (!content) return res.status(400).json({ error: 'Message content is required.' });
+  let attachments;
+  try {
+    attachments = normalizeAttachments(req.body?.attachments);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  let content = String(req.body?.content || '').trim();
+  if (!content && attachments.length) content = `Please analyze the attached file${attachments.length === 1 ? '' : 's'}: ${attachments.map((file) => file.name).join(', ')}`;
+  if (!content) return res.status(400).json({ error: 'Message content or an attachment is required.' });
   if (content.length > 16_000) return res.status(413).json({ error: 'Message is too long (16k characters max).' });
 
-  const settings = getSettings(req.user.id);
+  const settings = await getSettings(req.user.id);
   const provider = req.body?.provider || settings.provider;
-  const model = req.body?.model || settings.model;
-  const effective = { ...settings, provider, model };
+  if (!availableProviders().some((entry) => entry.id === provider)) {
+    return res.status(400).json({ error: `Provider "${provider}" is not configured on this server.` });
+  }
+  const model = String(req.body?.model || settings.model).slice(0, 120);
+  const mode = ['auto', 'reasoning', 'research', 'coding', 'planning', 'writing'].includes(req.body?.mode)
+    ? req.body.mode
+    : settings.mode;
+  const effective = { ...settings, provider, model, mode };
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -240,6 +257,7 @@ apiRouter.post('/sessions/:id/messages', requireSameOrigin, streamGuard, async (
       session,
       settings: effective,
       userText: content,
+      attachments,
       onEvent: send,
       signal: controller.signal,
     });
@@ -260,23 +278,40 @@ apiRouter.post('/sessions/:id/messages', requireSameOrigin, streamGuard, async (
 
 /** Convenience endpoint used by API-key clients: one-shot JSON answer. */
 apiRouter.post('/chat', requireSameOrigin, streamGuard, async (req, res) => {
-  const content = String(req.body?.content || req.body?.message || '').trim();
-  if (!content) return res.status(400).json({ error: 'content is required' });
-  const settings = getSettings(req.user.id);
-  let session = req.body?.session_id ? getChatSession(req.user.id, req.body.session_id) : null;
+  let attachments;
+  try {
+    attachments = normalizeAttachments(req.body?.attachments);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  let content = String(req.body?.content || req.body?.message || '').trim();
+  if (!content && attachments.length) content = `Please analyze the attached file${attachments.length === 1 ? '' : 's'}: ${attachments.map((file) => file.name).join(', ')}`;
+  if (!content) return res.status(400).json({ error: 'content or attachments are required' });
+  if (content.length > 16_000) return res.status(413).json({ error: 'Message is too long (16k characters max).' });
+  const settings = await getSettings(req.user.id);
+  const provider = req.body?.provider || settings.provider;
+  if (!availableProviders().some((entry) => entry.id === provider)) {
+    return res.status(400).json({ error: `Provider "${provider}" is not configured on this server.` });
+  }
+  const model = String(req.body?.model || settings.model).slice(0, 120);
+  const mode = ['auto', 'reasoning', 'research', 'coding', 'planning', 'writing'].includes(req.body?.mode)
+    ? req.body.mode
+    : settings.mode;
+  let session = req.body?.session_id ? await getChatSession(req.user.id, req.body.session_id) : null;
   if (!session) {
-    session = createChatSession(req.user.id, {
+    session = await createChatSession(req.user.id, {
       title: titleFromMessage(content),
-      provider: req.body?.provider || settings.provider,
-      model: req.body?.model || settings.model,
+      provider,
+      model,
     });
   }
   const events = [];
   const done = await runAgent({
     user: req.user,
     session,
-    settings: { ...settings, provider: req.body?.provider || settings.provider, model: req.body?.model || settings.model },
+    settings: { ...settings, provider, model, mode },
     userText: content,
+    attachments,
     onEvent: (event) => events.push(event),
   });
   const answer = events.filter((e) => e.type === 'text').map((e) => e.delta).join('');
@@ -296,8 +331,8 @@ apiRouter.post('/chat', requireSameOrigin, streamGuard, async (req, res) => {
 /* recent searches                                                     */
 /* ------------------------------------------------------------------ */
 
-apiRouter.get('/searches', (req, res) => {
-  const entries = recentSearches(req.user.id, {
+apiRouter.get('/searches', async (req, res) => {
+  const entries = await recentSearches(req.user.id, {
     limit: clamp(req.query.limit || 40, 1, 200),
     q: String(req.query.q || '').trim(),
     pinnedOnly: req.query.pinned === '1',
@@ -317,7 +352,7 @@ apiRouter.post('/searches', requireSameOrigin, async (req, res) => {
   if (!query) return res.status(400).json({ error: 'query is required' });
   try {
     const { provider, results, answer } = await runWebSearch(query, clamp(req.body?.max_results || 5, 1, 10));
-    recordSearch({
+    await recordSearch({
       userId: req.user.id,
       chatSessionId: req.body?.session_id || null,
       query,
@@ -327,24 +362,24 @@ apiRouter.post('/searches', requireSameOrigin, async (req, res) => {
     });
     return res.json({ query, provider, answer, results });
   } catch (error) {
-    recordSearch({ userId: req.user.id, query, provider: 'unavailable', results: [], source: 'user' });
+    await recordSearch({ userId: req.user.id, query, provider: 'unavailable', results: [], source: 'user' });
     return res.status(502).json({ error: error?.message || 'Search failed', query });
   }
 });
 
-apiRouter.post('/searches/:id/pin', requireSameOrigin, (req, res) => {
-  const pinned = toggleSearchPin(req.user.id, req.params.id);
+apiRouter.post('/searches/:id/pin', requireSameOrigin, async (req, res) => {
+  const pinned = await toggleSearchPin(req.user.id, req.params.id);
   if (pinned === null) return res.status(404).json({ error: 'Search not found' });
   res.json({ ok: true, pinned });
 });
 
-apiRouter.delete('/searches/:id', requireSameOrigin, (req, res) => {
-  deleteSearch(req.user.id, req.params.id);
+apiRouter.delete('/searches/:id', requireSameOrigin, async (req, res) => {
+  await deleteSearch(req.user.id, req.params.id);
   res.json({ ok: true });
 });
 
-apiRouter.delete('/searches', requireSameOrigin, (req, res) => {
-  clearSearches(req.user.id);
+apiRouter.delete('/searches', requireSameOrigin, async (req, res) => {
+  await clearSearches(req.user.id);
   res.json({ ok: true });
 });
 
@@ -352,20 +387,20 @@ apiRouter.delete('/searches', requireSameOrigin, (req, res) => {
 /* memories                                                            */
 /* ------------------------------------------------------------------ */
 
-apiRouter.get('/memories', (req, res) => {
-  res.json({ memories: listMemories(req.user.id) });
+apiRouter.get('/memories', async (req, res) => {
+  res.json({ memories: await listMemories(req.user.id) });
 });
 
-apiRouter.post('/memories', requireSameOrigin, (req, res) => {
+apiRouter.post('/memories', requireSameOrigin, async (req, res) => {
   const key = String(req.body?.key || '').trim();
   const value = String(req.body?.value || '').trim();
   if (!key || !value) return res.status(400).json({ error: 'key and value are required' });
-  rememberMemory(req.user.id, key, value, 'user');
-  res.status(201).json({ memories: listMemories(req.user.id) });
+  await rememberMemory(req.user.id, key, value, 'user');
+  res.status(201).json({ memories: await listMemories(req.user.id) });
 });
 
-apiRouter.delete('/memories/:id', requireSameOrigin, (req, res) => {
-  forgetMemory(req.user.id, req.params.id);
+apiRouter.delete('/memories/:id', requireSameOrigin, async (req, res) => {
+  await forgetMemory(req.user.id, req.params.id);
   res.json({ ok: true });
 });
 
@@ -373,11 +408,11 @@ apiRouter.delete('/memories/:id', requireSameOrigin, (req, res) => {
 /* settings                                                            */
 /* ------------------------------------------------------------------ */
 
-apiRouter.get('/settings', (req, res) => {
-  res.json({ settings: getSettings(req.user.id), available_tools: toolsForEnabled(undefined).map((t) => t.name) });
+apiRouter.get('/settings', async (req, res) => {
+  res.json({ settings: await getSettings(req.user.id), available_tools: toolsForEnabled(undefined).map((t) => t.name) });
 });
 
-apiRouter.put('/settings', requireSameOrigin, (req, res) => {
+apiRouter.put('/settings', requireSameOrigin, async (req, res) => {
   const body = req.body || {};
   if (body.provider && !availableProviders().some((p) => p.id === body.provider)) {
     return res.status(400).json({ error: `Provider "${body.provider}" is not configured on this server.` });
@@ -385,6 +420,12 @@ apiRouter.put('/settings', requireSameOrigin, (req, res) => {
   const patch = {};
   if (body.provider) patch.provider = body.provider;
   if (body.model) patch.model = String(body.model).slice(0, 120);
+  if (body.mode !== undefined) {
+    if (!['auto', 'reasoning', 'research', 'coding', 'planning', 'writing'].includes(body.mode)) {
+      return res.status(400).json({ error: 'Unsupported assistant mode.' });
+    }
+    patch.mode = body.mode;
+  }
   if (body.temperature !== undefined) patch.temperature = clamp(body.temperature, 0, 2);
   if (body.system_prompt !== undefined) patch.system_prompt = body.system_prompt ? String(body.system_prompt).slice(0, 8000) : null;
   if (Array.isArray(body.tools_enabled)) {
@@ -392,21 +433,28 @@ apiRouter.put('/settings', requireSameOrigin, (req, res) => {
     patch.tools_enabled = body.tools_enabled.filter((t) => valid.has(t));
   }
   if (body.theme) patch.theme = String(body.theme).slice(0, 20);
-  res.json({ settings: saveSettings(req.user.id, patch) });
+  res.json({ settings: await saveSettings(req.user.id, patch) });
 });
 
 /* ------------------------------------------------------------------ */
 /* stats (dashboard chips)                                             */
 /* ------------------------------------------------------------------ */
 
-apiRouter.get('/stats', (req, res) => {
-  const chats = one('SELECT COUNT(*) AS n FROM chat_sessions WHERE user_id = ? AND archived = 0', req.user.id).n;
-  const messages = one('SELECT COUNT(*) AS n FROM messages WHERE user_id = ?', req.user.id).n;
-  const searches = one('SELECT COUNT(*) AS n FROM searches WHERE user_id = ?', req.user.id).n;
-  const memories = one('SELECT COUNT(*) AS n FROM memories WHERE user_id = ?', req.user.id).n;
-  const session = req.auth?.sessionId
-    ? one('SELECT created_at, expires_at FROM sessions WHERE id = ?', req.auth.sessionId)
-    : null;
-  const lastSearch = one('SELECT query, created_at FROM searches WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', req.user.id);
-  res.json({ chats, messages, searches, memories, session, last_search: lastSearch });
+apiRouter.get('/stats', async (req, res) => {
+  const [chatCount, messageCount, searchCount, memoryCount, session, lastSearch] = await Promise.all([
+    one('SELECT COUNT(*) AS n FROM chat_sessions WHERE user_id = ? AND archived = 0', req.user.id),
+    one('SELECT COUNT(*) AS n FROM messages WHERE user_id = ?', req.user.id),
+    one('SELECT COUNT(*) AS n FROM searches WHERE user_id = ?', req.user.id),
+    one('SELECT COUNT(*) AS n FROM memories WHERE user_id = ?', req.user.id),
+    req.auth?.sessionId ? one('SELECT created_at, expires_at FROM sessions WHERE id = ?', req.auth.sessionId) : null,
+    one('SELECT query, created_at FROM searches WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', req.user.id),
+  ]);
+  res.json({
+    chats: Number(chatCount?.n || 0),
+    messages: Number(messageCount?.n || 0),
+    searches: Number(searchCount?.n || 0),
+    memories: Number(memoryCount?.n || 0),
+    session,
+    last_search: lastSearch,
+  });
 });

@@ -273,23 +273,38 @@ async function* ollamaStream({ baseUrl, model, messages, tools, temperature, sig
   yield { type: 'end', finishReason: 'stop' };
 }
 
-/** Gemini rejects some JSON-schema keywords; keep it minimal. */
+/** Gemini accepts a smaller JSON-schema subset; strip unsupported keywords recursively. */
 function sanitizeSchema(schema) {
-  if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
-  const out = { type: 'object', properties: {} };
-  for (const [key, value] of Object.entries(schema.properties || {})) {
-    const entry = { type: value.type === 'integer' ? 'number' : value.type || 'string' };
-    if (value.description) entry.description = value.description;
-    if (Array.isArray(value.enum)) entry.enum = value.enum;
-    out.properties[key] = entry;
-  }
-  if (Array.isArray(schema.required)) out.required = schema.required;
-  return out;
+  const clean = (value) => {
+    if (!value || typeof value !== 'object') return { type: 'string' };
+    const out = { type: value.type === 'integer' ? 'number' : value.type || 'string' };
+    if (value.description) out.description = value.description;
+    if (Array.isArray(value.enum)) out.enum = value.enum;
+    if (value.type === 'array' && value.items) out.items = clean(value.items);
+    if (value.type === 'object' && value.properties) {
+      out.properties = Object.fromEntries(Object.entries(value.properties).map(([key, child]) => [key, clean(child)]));
+    }
+    if (Array.isArray(value.required)) out.required = value.required;
+    return out;
+  };
+  return clean(schema || { type: 'object', properties: {} });
 }
 
 /* ------------------------------------------------------------------ */
 /* message conversion per provider                                     */
 /* ------------------------------------------------------------------ */
+
+function attachmentLabel(attachment) {
+  return `[Untrusted attachment: ${String(attachment.name || 'file').slice(0, 128)}]`;
+}
+
+function assertOpenAIAttachments(attachments = []) {
+  for (const attachment of attachments) {
+    if (attachment.kind !== 'text' && attachment.kind !== 'image') {
+      throw new Error(`${attachment.name} needs Gemini for audio/video/PDF input. OpenAI-compatible providers accept text and images here.`);
+    }
+  }
+}
 
 export function toOpenAIMessages({ system, messages }) {
   const out = [];
@@ -308,7 +323,24 @@ export function toOpenAIMessages({ system, messages }) {
     } else if (m.role === 'tool') {
       out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: String(m.content).slice(0, 24_000) });
     } else if (m.role === 'user' || m.role === 'assistant') {
-      out.push({ role: m.role, content: m.content });
+      const attachments = m.role === 'user' ? m.attachments || [] : [];
+      assertOpenAIAttachments(attachments);
+      if (!attachments.length) {
+        out.push({ role: m.role, content: m.content });
+        continue;
+      }
+      const parts = [{ type: 'text', text: m.content || 'Please analyze the attached file(s).' }];
+      for (const attachment of attachments) {
+        if (attachment.kind === 'text') {
+          parts.push({ type: 'text', text: `\n${attachmentLabel(attachment)}\n${String(attachment.text || '').slice(0, 600_000)}` });
+        } else {
+          parts.push({
+            type: 'image_url',
+            image_url: { url: `data:${attachment.mimeType};base64,${attachment.data}` },
+          });
+        }
+      }
+      out.push({ role: 'user', content: parts });
     }
   }
   return out;
@@ -318,7 +350,25 @@ export function toAnthropicMessages({ messages }) {
   const out = [];
   for (const m of messages) {
     if (m.role === 'user') {
-      out.push({ role: 'user', content: [{ type: 'text', text: m.content }] });
+      const content = [{ type: 'text', text: m.content || 'Please analyze the attached file(s).' }];
+      for (const attachment of m.attachments || []) {
+        if (attachment.kind === 'text') {
+          content.push({ type: 'text', text: `${attachmentLabel(attachment)}\n${String(attachment.text || '').slice(0, 600_000)}` });
+        } else if (attachment.kind === 'image') {
+          content.push({
+            type: 'image',
+            source: { type: 'base64', media_type: attachment.mimeType, data: attachment.data },
+          });
+        } else if (attachment.mimeType === 'application/pdf') {
+          content.push({
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: attachment.data },
+          });
+        } else {
+          throw new Error(`${attachment.name} needs Gemini for audio/video input. Anthropic supports text, images and PDF documents here.`);
+        }
+      }
+      out.push({ role: 'user', content });
     } else if (m.role === 'assistant') {
       const blocks = [];
       if (m.content) blocks.push({ type: 'text', text: m.content });
@@ -350,7 +400,15 @@ export function toGeminiContents({ messages }) {
   const out = [];
   for (const m of messages) {
     if (m.role === 'user') {
-      out.push({ role: 'user', parts: [{ text: m.content }] });
+      const parts = [{ text: m.content || 'Please analyze the attached file(s).' }];
+      for (const attachment of m.attachments || []) {
+        if (attachment.kind === 'text') {
+          parts.push({ text: `${attachmentLabel(attachment)}\n${String(attachment.text || '').slice(0, 600_000)}` });
+        } else {
+          parts.push({ inlineData: { mimeType: attachment.mimeType, data: attachment.data } });
+        }
+      }
+      out.push({ role: 'user', parts });
     } else if (m.role === 'assistant') {
       const parts = [];
       if (m.content) parts.push({ text: m.content });
@@ -371,6 +429,37 @@ export function toGeminiContents({ messages }) {
         ],
       });
     }
+  }
+  return out;
+}
+
+export function toOllamaMessages({ system, messages }) {
+  const out = [];
+  if (system) out.push({ role: 'system', content: system });
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      out.push({ role: 'tool', content: String(message.content).slice(0, 24_000), name: message.name || 'tool' });
+      continue;
+    }
+    if (message.role === 'assistant' && message.tool_calls?.length) {
+      out.push({
+        role: 'assistant',
+        content: message.content || '',
+        tool_calls: message.tool_calls.map((call) => ({
+          function: { name: call.name, arguments: safeArgs(call.args) },
+        })),
+      });
+      continue;
+    }
+    const attachments = message.role === 'user' ? message.attachments || [] : [];
+    const text = [message.content || '', ...attachments.filter((a) => a.kind === 'text').map((a) => `${attachmentLabel(a)}\n${String(a.text || '').slice(0, 600_000)}`)]
+      .filter(Boolean)
+      .join('\n\n');
+    const images = attachments.filter((a) => a.kind === 'image').map((a) => a.data);
+    if (attachments.some((a) => a.kind !== 'image' && a.kind !== 'text')) {
+      throw new Error('Ollama accepts text and images here; use Gemini for audio, video or PDF attachments.');
+    }
+    out.push({ role: message.role, content: text || 'Please analyze the attached image.', ...(images.length ? { images } : {}) });
   }
   return out;
 }
@@ -410,7 +499,7 @@ export function streamModel({ providerId, model, system, messages, tools, temper
       return geminiStream({ ...common, apiKey: provider.apiKey, baseUrl: provider.baseUrl, system, contents: toGeminiContents({ messages }) });
     case 'ollama':
       if (!provider.baseUrl) throw new Error('OLLAMA_BASE_URL is not configured');
-      return ollamaStream({ ...common, baseUrl: provider.baseUrl, messages: toOpenAIMessages({ system, messages }) });
+      return ollamaStream({ ...common, baseUrl: provider.baseUrl, messages: toOllamaMessages({ system, messages }) });
     default:
       throw new Error(`Provider "${providerId}" has no streaming adapter`);
   }

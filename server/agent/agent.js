@@ -17,6 +17,7 @@ export async function runAgent({
   session,
   settings,
   userText,
+  attachments = [],
   persistUserMessage = true,
   onEvent = () => {},
   signal,
@@ -28,37 +29,40 @@ export async function runAgent({
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   // ---- persist the user's turn -------------------------------------
-  const isFirstMessage = all('SELECT id FROM messages WHERE chat_session_id = ? LIMIT 1', session.id).length === 0;
+  const isFirstMessage = (await all('SELECT id FROM messages WHERE chat_session_id = ? LIMIT 1', session.id)).length === 0;
   if (persistUserMessage) {
-    addMessage({ sessionId: session.id, userId: user.id, role: 'user', content: userText });
+    await addMessage({ sessionId: session.id, userId: user.id, role: 'user', content: userText, attachments });
   }
 
   let title = session.title;
   if (isFirstMessage && (session.title === 'New chat' || !session.title)) {
     title = titleFromMessage(userText);
-    touchChatSession(session.id, { title });
+    await touchChatSession(session.id, { title });
     onEvent({ type: 'title', title });
   }
 
   // ---- assemble model context --------------------------------------
-  const memories = listMemories(user.id);
-  const searches = recentSearches(user.id, { limit: 8 });
+  const memories = await listMemories(user.id);
+  const searches = await recentSearches(user.id, { limit: 8 });
   const system = buildSystemPrompt({
     customPrompt: settings.system_prompt,
+    mode: settings.mode || 'auto',
     memories,
     recentSearches: searches,
     user,
     sessionTitle: title,
   });
 
-  const historyRows = all(
-    `SELECT * FROM messages WHERE chat_session_id = ? AND user_id = ? ORDER BY created_at ASC, rowid ASC LIMIT 400`,
+  const historyRows = await all(
+    `SELECT * FROM messages WHERE chat_session_id = ? AND user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
     session.id,
     user.id,
+    config.maxHistoryMessages,
   );
+  historyRows.reverse();
   // The user's turn is already persisted above, so the stored history *includes*
   // it — never drop it, or the model answers the previous message.
-  const messages = rowsToModelMessages(historyRows);
+  const messages = limitConversationContext(rowsToModelMessages(historyRows), config.maxContextChars);
 
   onEvent({ type: 'start', sessionId: session.id, provider: providerId, model, title });
 
@@ -82,7 +86,7 @@ export async function runAgent({
 
     const runStream = (activeProvider) =>
       activeProvider === 'local'
-        ? runLocalEngine({ messages, tools, context: { userId: user.id, user, sessionId: session.id } })
+        ? runLocalEngine({ messages, tools, context: { userId: user.id, user, sessionId: session.id, mode: settings.mode || 'auto' } })
         : streamModel({
             providerId: activeProvider,
             model,
@@ -155,7 +159,7 @@ export async function runAgent({
     }
 
     // Persist the assistant's tool-calling turn.
-    addMessage({
+    await addMessage({
       sessionId: session.id,
       userId: user.id,
       role: 'assistant',
@@ -174,18 +178,18 @@ export async function runAgent({
       const args = parseArgs(call.args);
       if (!toolMap.has(call.name)) {
         const payload = { ok: false, error: `Tool "${call.name}" is not enabled`, __tool: call.name };
-        pushToolResult(messages, session, user, call, payload, onEvent);
+        await pushToolResult(messages, session, user, call, payload, onEvent);
         continue;
       }
       onEvent({ type: 'tool_start', id: call.id, name: call.name, args });
-      const result = await executeTool(call.name, args, { userId: user.id, chatSessionId: session.id });
+      const result = await executeTool(call.name, args, { userId: user.id, chatSessionId: session.id, attachments });
       const payload = { ...result, __tool: call.name };
-      pushToolResult(messages, session, user, call, payload, onEvent);
+      await pushToolResult(messages, session, user, call, payload, onEvent);
     }
   }
 
   // ---- persist the final assistant answer ---------------------------
-  const finalRow = addMessage({
+  const finalRow = await addMessage({
     sessionId: session.id,
     userId: user.id,
     role: 'assistant',
@@ -214,11 +218,11 @@ export async function runAgent({
   return done;
 }
 
-function pushToolResult(messages, session, user, call, payload, onEvent) {
+async function pushToolResult(messages, session, user, call, payload, onEvent) {
   // The stored/forwarded content is the JSON payload: remote models read it
   // fine and the local engine parses it to write its answer.
   const content = JSON.stringify(payload);
-  addMessage({
+  await addMessage({
     sessionId: session.id,
     userId: user.id,
     role: 'tool',
@@ -250,6 +254,95 @@ function parseArgs(args) {
   }
 }
 
+function limitConversationContext(messages, maxChars) {
+  if (!messages.length) return messages;
+  const groups = [];
+  let group = [];
+  for (const message of messages) {
+    if (message.role === 'user' && group.length) {
+      groups.push(group);
+      group = [];
+    }
+    group.push(message);
+  }
+  if (group.length) groups.push(group);
+
+  const cost = (message) => String(message.content || '').length +
+    (message.attachments || []).reduce((sum, attachment) =>
+      sum + (attachment.kind === 'text' ? String(attachment.text || '').length : 0), 0);
+  const chosen = [];
+  let total = 0;
+  for (const candidate of groups.reverse()) {
+    const groupCost = candidate.reduce((sum, message) => sum + cost(message), 0);
+    if (chosen.length && total + groupCost > maxChars) break;
+    chosen.unshift(candidate);
+    total += groupCost;
+    if (total >= maxChars) break;
+  }
+
+  const selected = chosen.flat();
+  if (!selected.length) return selected;
+
+  // Do not resend an unbounded trail of image/PDF/audio/video base64. Retain
+  // only the newest three media files and replace older ones with safe labels.
+  let mediaKept = 0;
+  let mediaBytes = 0;
+  for (const message of [...selected].reverse()) {
+    if (message.role !== 'user' || !Array.isArray(message.attachments)) continue;
+    message.attachments = message.attachments.map((attachment) => {
+      if (attachment.kind === 'text') return attachment;
+      const size = Number(attachment.size) || Math.floor(String(attachment.data || '').length * 3 / 4);
+      if (mediaKept < 3 && mediaBytes + size <= 2_600_000) {
+        mediaKept += 1;
+        mediaBytes += size;
+        return attachment;
+      }
+      return { name: attachment.name, mimeType: attachment.mimeType, kind: 'text', text: `[Earlier media attachment ${attachment.name} omitted from model context.]` };
+    });
+  }
+
+  // Reserve the configured character budget for the newest user prompt first,
+  // then tool evidence and other recent turns. Binary payloads use the separate
+  // media budget above; text attachments are clipped only in model context (the
+  // original attachment is still stored and supplied to deterministic tools).
+  const latestUserIndex = selected.map((message) => message.role).lastIndexOf('user');
+  const priority = [];
+  if (latestUserIndex >= 0) priority.push(latestUserIndex);
+  for (let index = selected.length - 1; index >= 0; index -= 1) {
+    if (index !== latestUserIndex && selected[index].role === 'tool') priority.push(index);
+  }
+  for (let index = selected.length - 1; index >= 0; index -= 1) {
+    if (index !== latestUserIndex && selected[index].role !== 'tool') priority.push(index);
+  }
+
+  const clip = (value, budget, marker) => {
+    const text = String(value || '');
+    if (text.length <= budget) return text;
+    if (budget <= marker.length) return marker.slice(0, Math.max(0, budget));
+    return `${text.slice(0, budget - marker.length)}${marker}`;
+  };
+
+  let remaining = maxChars;
+  for (const index of priority) {
+    const message = selected[index];
+    const original = String(message.content || '');
+    message.content = clip(original, remaining, '\n[Conversation context truncated to fit its configured limit.]');
+    remaining = Math.max(0, remaining - message.content.length);
+  }
+
+  for (const message of [...selected].reverse()) {
+    if (message.role !== 'user' || !Array.isArray(message.attachments)) continue;
+    for (const attachment of [...message.attachments].reverse()) {
+      if (attachment.kind !== 'text') continue;
+      const original = String(attachment.text || '');
+      const marker = '\n[Attachment text truncated for model context; the full file remains stored.]';
+      attachment.text = clip(original, remaining, marker);
+      remaining = Math.max(0, remaining - attachment.text.length);
+    }
+  }
+  return selected;
+}
+
 export function rowsToModelMessages(rows) {
   const out = [];
   for (const row of rows) {
@@ -262,7 +355,11 @@ export function rowsToModelMessages(rows) {
         tool_calls: safeJsonParse(row.tool_calls, undefined),
       });
     } else if (row.role === 'user') {
-      out.push({ role: 'user', content: row.content });
+      out.push({
+        role: 'user',
+        content: row.content,
+        attachments: safeJsonParse(row.attachments, []),
+      });
     }
   }
   return out;

@@ -3,11 +3,11 @@ import {
   all,
   forgetMemory,
   listMemories,
-  one,
   recentSearches,
   recordSearch,
   rememberMemory,
 } from '../db.js';
+import { isTextAttachment } from './attachments.js';
 import { truncate } from '../lib/util.js';
 import { evaluateExpression, prettyNumber } from './math.js';
 
@@ -223,6 +223,20 @@ export const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'deep_research',
+    description:
+      'Research a complex or current topic using several focused web searches, compare independent sources, and return source-linked evidence. Use for research briefs, comparisons, or multi-part questions.',
+    parameters: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'The main research question or topic.' },
+        aspects: { type: 'array', items: { type: 'string' }, description: 'Up to three focused sub-questions to investigate.' },
+        max_results: { type: 'integer', description: 'Results per query (1-5).' },
+      },
+      required: ['topic'],
+    },
+  },
+  {
     name: 'fetch_page',
     description: 'Fetch a URL and return its readable text. Use after web_search when a snippet is not enough.',
     parameters: {
@@ -241,6 +255,20 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: { expression: { type: 'string', description: 'e.g. "(1290 * 1.18) / 3"' } },
       required: ['expression'],
+    },
+  },
+  {
+    name: 'data_analysis',
+    description:
+      'Analyze an attached CSV using deterministic statistics, missing-value checks, numeric summaries, and optional grouped count/sum/average results. Use the latest attached CSV; do not invent or execute code.',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_name: { type: 'string', description: 'Optional exact CSV attachment filename.' },
+        group_by: { type: 'string', description: 'Optional categorical column for a grouped chart.' },
+        value_column: { type: 'string', description: 'Numeric column to aggregate when group_by is provided.' },
+        operation: { type: 'string', enum: ['count', 'sum', 'average'], description: 'Grouped operation; defaults to count.' },
+      },
     },
   },
   {
@@ -294,8 +322,180 @@ export const TOOL_DEFINITIONS = [
 /* execution                                                           */
 /* ------------------------------------------------------------------ */
 
+export function parseCsv(text) {
+  const source = String(text || '').replace(/^\uFEFF/, '');
+  if (source.length > 600_000) throw new Error('CSV is too large to analyze (600 KB maximum).');
+  const rows = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quoted) {
+      if (ch === '"' && source[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else if (ch === '"') {
+        quoted = false;
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"' && field === '') {
+      quoted = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && source[i + 1] === '\n') i += 1;
+      row.push(field);
+      if (row.some((cell) => String(cell).trim() !== '')) rows.push(row);
+      row = [];
+      field = '';
+      if (rows.length > 10_001) throw new Error('CSV is limited to 10,000 data rows.');
+    } else {
+      field += ch;
+    }
+  }
+  if (quoted) throw new Error('CSV contains an unclosed quoted field.');
+  row.push(field);
+  if (row.some((cell) => String(cell).trim() !== '')) rows.push(row);
+  if (rows.length < 2) throw new Error('CSV needs a header row and at least one data row.');
+  if (rows[0].length > 50) throw new Error('CSV is limited to 50 columns.');
+
+  const seen = new Map();
+  const headers = rows.shift().map((value, index) => {
+    const base = String(value || '').trim().slice(0, 100) || `column_${index + 1}`;
+    const count = (seen.get(base) || 0) + 1;
+    seen.set(base, count);
+    return count === 1 ? base : `${base}_${count}`;
+  });
+  const records = rows.slice(0, 10_000).map((values) =>
+    Object.fromEntries(headers.map((header, index) => [header, String(values[index] ?? '').trim()])),
+  );
+  return { headers, rows: records };
+}
+
+const numericValue = (value) => {
+  const clean = String(value ?? '').trim().replace(/,/g, '');
+  if (!clean) return null;
+  const number = Number(clean);
+  return Number.isFinite(number) ? number : null;
+};
+
+function analyzeCsv(attachment, args = {}) {
+  const { headers, rows } = parseCsv(attachment.text);
+  const columns = headers.map((name) => {
+    const values = rows.map((row) => row[name]);
+    const present = values.filter((value) => value !== '');
+    const numeric = present.map(numericValue).filter((value) => value !== null);
+    const isNumeric = numeric.length > 0 && numeric.length / Math.max(present.length, 1) >= 0.8;
+    const result = {
+      name,
+      type: isNumeric ? 'number' : 'category',
+      rows: rows.length,
+      missing: rows.length - present.length,
+      unique: new Set(present).size,
+    };
+    if (isNumeric) {
+      const sorted = [...numeric].sort((a, b) => a - b);
+      result.min = sorted[0];
+      result.max = sorted.at(-1);
+      result.mean = Number((numeric.reduce((sum, value) => sum + value, 0) / numeric.length).toFixed(4));
+      result.median = Number((sorted.length % 2
+        ? sorted[Math.floor(sorted.length / 2)]
+        : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2).toFixed(4));
+    } else {
+      result.top_values = [...present.reduce((map, value) => map.set(value, (map.get(value) || 0) + 1), new Map())]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([value, count]) => ({ value: truncate(value, 80), count }));
+    }
+    return result;
+  });
+
+  const groupBy = String(args.group_by || '').trim();
+  let series;
+  let chart;
+  if (groupBy) {
+    if (!headers.includes(groupBy)) throw new Error(`Column "${groupBy}" is not in this CSV.`);
+    const operation = ['count', 'sum', 'average'].includes(args.operation) ? args.operation : 'count';
+    const valueColumn = String(args.value_column || '').trim();
+    if (operation !== 'count' && !headers.includes(valueColumn)) {
+      throw new Error(`Choose a valid value_column for ${operation}; available columns: ${headers.join(', ')}.`);
+    }
+    const buckets = new Map();
+    for (const record of rows) {
+      const label = record[groupBy] || '(blank)';
+      if (!buckets.has(label)) buckets.set(label, { count: 0, sum: 0, values: 0 });
+      const bucket = buckets.get(label);
+      bucket.count += 1;
+      if (operation !== 'count') {
+        const value = numericValue(record[valueColumn]);
+        if (value !== null) {
+          bucket.sum += value;
+          bucket.values += 1;
+        }
+      }
+    }
+    series = [...buckets.entries()].map(([label, bucket]) => ({
+      label: truncate(label, 80),
+      value: operation === 'count'
+        ? bucket.count
+        : Number((operation === 'sum' ? bucket.sum : bucket.sum / Math.max(bucket.values, 1)).toFixed(4)),
+    })).sort((a, b) => b.value - a.value).slice(0, 30);
+    chart = { group_by: groupBy, value_column: valueColumn || null, operation, series };
+  }
+
+  return {
+    ok: true,
+    file_name: attachment.name,
+    row_count: rows.length,
+    columns,
+    ...(chart ? { chart } : {}),
+    sample: rows.slice(0, 5),
+    summary: `Analyzed ${rows.length} rows and ${headers.length} columns from ${attachment.name}.`,
+  };
+}
+
+async function runDeepResearch(args, { userId, chatSessionId }) {
+  const topic = String(args.topic || args.query || '').trim();
+  if (!topic) throw new Error('Research topic is required.');
+  const aspects = Array.isArray(args.aspects)
+    ? args.aspects.map((aspect) => String(aspect).trim()).filter(Boolean).slice(0, 3)
+    : [];
+  const queries = [...new Set([topic, ...aspects.map((aspect) => `${topic} ${aspect}`)])].slice(0, 4);
+  const attempts = await Promise.all(queries.map(async (query) => {
+    try {
+      const result = await runWebSearch(query, Math.min(Math.max(Number(args.max_results) || 4, 1), 5));
+      await recordSearch({ userId, chatSessionId, query, provider: result.provider, results: result.results, source: 'agent' });
+      return { query, ...result };
+    } catch (error) {
+      await recordSearch({ userId, chatSessionId, query, provider: 'unavailable', results: [], source: 'agent' });
+      return { query, error: error?.message || String(error), results: [] };
+    }
+  }));
+  const sources = [];
+  const seen = new Set();
+  for (const attempt of attempts) {
+    for (const result of attempt.results || []) {
+      if (!result.url || seen.has(result.url)) continue;
+      seen.add(result.url);
+      sources.push({ ...result, query: attempt.query, provider: attempt.provider || 'unknown' });
+    }
+  }
+  return {
+    ok: sources.length > 0,
+    topic,
+    queries,
+    sources: sources.slice(0, 16),
+    failures: attempts.filter((attempt) => attempt.error).map((attempt) => ({ query: attempt.query, error: attempt.error })),
+    ...(sources.length ? {} : { error: attempts.map((attempt) => attempt.error).filter(Boolean).join('; ') || 'No sources were returned.' }),
+    summary: `${sources.length} unique source(s) found across ${queries.length} search quer${queries.length === 1 ? 'y' : 'ies'}.`,
+  };
+}
+
 export async function executeTool(name, args = {}, ctx = {}) {
-  const { userId, chatSessionId = null } = ctx;
+  const { userId, chatSessionId = null, attachments = [] } = ctx;
   const started = Date.now();
 
   try {
@@ -303,7 +503,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
       case 'web_search': {
         try {
           const { provider, query, answer, results } = await runWebSearch(args.query, args.max_results);
-          recordSearch({ userId, chatSessionId, query, provider, results, source: 'agent' });
+          await recordSearch({ userId, chatSessionId, query, provider, results, source: 'agent' });
           return {
             ok: true,
             provider,
@@ -314,7 +514,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
           };
         } catch (error) {
           // Keep the attempt in the user's search history, flagged as unavailable.
-          recordSearch({
+          await recordSearch({
             userId,
             chatSessionId,
             query: String(args.query || '').trim(),
@@ -324,6 +524,10 @@ export async function executeTool(name, args = {}, ctx = {}) {
           });
           throw error;
         }
+      }
+
+      case 'deep_research': {
+        return await runDeepResearch(args, { userId, chatSessionId });
       }
 
       case 'fetch_page': {
@@ -352,6 +556,16 @@ export async function executeTool(name, args = {}, ctx = {}) {
         };
       }
 
+      case 'data_analysis': {
+        const candidate = attachments.find((attachment) => {
+          const csvName = String(attachment.name || '').toLowerCase().endsWith('.csv');
+          return csvName && isTextAttachment(attachment) && typeof attachment.text === 'string' &&
+            (!args.file_name || attachment.name === args.file_name);
+        });
+        if (!candidate) throw new Error('Attach a CSV file (under 600 KB) and ask me to analyze it.');
+        return analyzeCsv(candidate, args);
+      }
+
       case 'clock': {
         const tz = String(args.timezone || 'UTC');
         let formatted;
@@ -371,22 +585,22 @@ export async function executeTool(name, args = {}, ctx = {}) {
         const action = String(args.action || 'recall');
         if (action === 'save') {
           if (!args.key) throw new Error('key is required to save a memory');
-          rememberMemory(userId, args.key, args.value ?? '', 'agent');
+          await rememberMemory(userId, args.key, args.value ?? '', 'agent');
           return { ok: true, saved: { key: args.key, value: args.value }, summary: `Remembered "${args.key}"` };
         }
         if (action === 'forget') {
           if (!args.key) throw new Error('key is required to forget a memory');
-          forgetMemory(userId, args.key);
+          await forgetMemory(userId, args.key);
           return { ok: true, forgotten: args.key, summary: `Forgot "${args.key}"` };
         }
-        const memories = listMemories(userId).map((m) => ({ key: m.key, value: m.value, updated_at: m.updated_at }));
+        const memories = (await listMemories(userId)).map((m) => ({ key: m.key, value: m.value, updated_at: m.updated_at }));
         return { ok: true, memories, summary: `${memories.length} memor(y/ies) on file` };
       }
 
       case 'session_search': {
         const q = `%${String(args.query || '').trim()}%`;
         const limit = Math.min(Math.max(Number(args.limit) || 8, 1), 40);
-        const rows = all(
+        const rows = await all(
           `SELECT m.id, m.role, m.content, m.created_at, s.id AS session_id, s.title
            FROM messages m JOIN chat_sessions s ON s.id = m.chat_session_id
            WHERE m.user_id = ? AND m.content LIKE ?
@@ -409,7 +623,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
       }
 
       case 'search_history': {
-        const entries = recentSearches(userId, { limit: args.limit || 10, q: args.query || '' });
+        const entries = await recentSearches(userId, { limit: args.limit || 10, q: args.query || '' });
         return {
           ok: true,
           searches: entries.map((s) => ({ query: s.query, provider: s.provider, results: s.result_count, when: s.created_at, pinned: s.pinned })),
@@ -447,10 +661,18 @@ export function toolResultToText(name, result) {
       ]
         .filter(Boolean)
         .join('\n');
+    case 'deep_research':
+      return [
+        `TOOL deep_research ("${result.topic}")`,
+        ...result.sources.map((source, index) => `[${index + 1}] ${source.title || source.url}\n${source.url}\nSearch: ${source.query}\n${source.snippet || ''}`),
+        result.failures?.length ? `Searches with no response: ${result.failures.map((failure) => failure.query).join('; ')}` : '',
+      ].filter(Boolean).join('\n\n');
     case 'fetch_page':
       return `TOOL fetch_page (${result.url})${result.title ? ` — ${result.title}` : ''}\n${result.text}`;
     case 'calculator':
       return `TOOL calculator: ${result.expression} = ${result.result}`;
+    case 'data_analysis':
+      return `TOOL data_analysis: ${JSON.stringify({ file_name: result.file_name, row_count: result.row_count, columns: result.columns, chart: result.chart, sample: result.sample }).slice(0, 18_000)}`;
     case 'clock':
       return `TOOL clock: ${result.formatted} (${result.iso})`;
     case 'memory':

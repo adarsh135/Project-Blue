@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { config } from './config.js';
-import { all, audit, one, run } from './db.js';
+import { all, audit, consumeRateLimit, one, run } from './db.js';
 import { clientIp, id, normalizeEmail, now, timingSafeEqual } from './lib/util.js';
 
 const scrypt = promisify(crypto.scrypt);
@@ -71,11 +71,11 @@ export function newSessionToken() {
   return { sessionId, token: `${sessionId}.${secret}` };
 }
 
-export function createSession({ userId, token, userAgent = '', ip = '' }) {
+export async function createSession({ userId, token, userAgent = '', ip = '' }) {
   const ts = now();
   const expires = new Date(Date.now() + config.sessionTtlHours * 3600 * 1000).toISOString();
   const sessionId = token.split('.')[0];
-  run(
+  await run(
     `INSERT INTO sessions (id, user_id, token_hash, user_agent, ip, created_at, last_seen_at, expires_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     sessionId,
@@ -90,14 +90,14 @@ export function createSession({ userId, token, userAgent = '', ip = '' }) {
   return one('SELECT * FROM sessions WHERE id = ?', sessionId);
 }
 
-export function findSessionByToken(token) {
+export async function findSessionByToken(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) return null;
   const hash = sha256(token);
-  const row = one('SELECT * FROM sessions WHERE token_hash = ?', hash);
+  const row = await one('SELECT * FROM sessions WHERE token_hash = ?', hash);
   if (!row) return null;
   if (row.revoked_at) return { ...row, reason: 'revoked' };
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), row.id);
+    await run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), row.id);
     return { ...row, reason: 'expired' };
   }
   // Guard against a forged session id + hash collision attempt.
@@ -105,11 +105,11 @@ export function findSessionByToken(token) {
   return row;
 }
 
-export function touchSession(sessionId) {
-  run('UPDATE sessions SET last_seen_at = ? WHERE id = ?', now(), sessionId);
+export async function touchSession(sessionId) {
+  await run('UPDATE sessions SET last_seen_at = ? WHERE id = ?', now(), sessionId);
 }
 
-export function listSessions(userId) {
+export async function listSessions(userId) {
   return all(
     `SELECT id, user_agent, ip, created_at, last_seen_at, expires_at, revoked_at
      FROM sessions WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 100`,
@@ -117,20 +117,20 @@ export function listSessions(userId) {
   );
 }
 
-export function revokeSession(userId, sessionId) {
-  run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND user_id = ?', now(), sessionId, userId);
+export async function revokeSession(userId, sessionId) {
+  await run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND user_id = ?', now(), sessionId, userId);
 }
 
-export function revokeAllSessions(userId, exceptId = null) {
+export async function revokeAllSessions(userId, exceptId = null) {
   if (exceptId) {
-    run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND id != ? AND revoked_at IS NULL', now(), userId, exceptId);
+    await run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND id != ? AND revoked_at IS NULL', now(), userId, exceptId);
   } else {
-    run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', now(), userId);
+    await run('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL', now(), userId);
   }
 }
 
-export function pruneExpiredSessions() {
-  run(
+export async function pruneExpiredSessions() {
+  await run(
     `UPDATE sessions SET revoked_at = ? WHERE revoked_at IS NULL AND expires_at < ?`,
     now(),
     now(),
@@ -141,12 +141,12 @@ export function pruneExpiredSessions() {
 /* API keys (machine credentials)                                      */
 /* ------------------------------------------------------------------ */
 
-export function createApiKey(userId, label = 'API key', scopes = ['chat']) {
+export async function createApiKey(userId, label = 'API key', scopes = ['chat']) {
   const prefix = crypto.randomBytes(4).toString('hex');
   const secret = crypto.randomBytes(24).toString('base64url');
   const plaintext = `blue_sk_${prefix}_${secret}`;
   const keyId = id('key');
-  run(
+  await run(
     `INSERT INTO credentials (id, user_id, kind, label, prefix, secret_hash, scopes, created_at)
      VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?)`,
     keyId,
@@ -160,7 +160,7 @@ export function createApiKey(userId, label = 'API key', scopes = ['chat']) {
   return { id: keyId, plaintext, prefix, label };
 }
 
-export function listApiKeys(userId) {
+export async function listApiKeys(userId) {
   return all(
     `SELECT id, label, prefix, scopes, last_used_at, expires_at, revoked_at, created_at
      FROM credentials WHERE user_id = ? AND kind = 'api_key' ORDER BY created_at DESC`,
@@ -168,21 +168,21 @@ export function listApiKeys(userId) {
   );
 }
 
-export function revokeApiKey(userId, keyId) {
-  run(`UPDATE credentials SET revoked_at = ? WHERE id = ? AND user_id = ? AND kind = 'api_key'`, now(), keyId, userId);
+export async function revokeApiKey(userId, keyId) {
+  await run(`UPDATE credentials SET revoked_at = ? WHERE id = ? AND user_id = ? AND kind = 'api_key'`, now(), keyId, userId);
   return one('SELECT * FROM credentials WHERE id = ? AND user_id = ?', keyId, userId);
 }
 
-export function userFromApiKey(bearer) {
+export async function userFromApiKey(bearer) {
   const m = /^blue_sk_([0-9a-f]{8})_([A-Za-z0-9_-]+)$/.exec(String(bearer || '').trim());
   if (!m) return null;
   const [, prefix, secret] = m;
-  const row = one(`SELECT * FROM credentials WHERE kind = 'api_key' AND prefix = ?`, prefix);
+  const row = await one(`SELECT * FROM credentials WHERE kind = 'api_key' AND prefix = ?`, prefix);
   if (!row || row.revoked_at) return null;
   if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
   if (!timingSafeEqual(row.secret_hash, sha256(secret))) return null;
-  run('UPDATE credentials SET last_used_at = ? WHERE id = ?', now(), row.id);
-  const user = one('SELECT * FROM users WHERE id = ?', row.user_id);
+  await run('UPDATE credentials SET last_used_at = ? WHERE id = ?', now(), row.id);
+  const user = await one('SELECT * FROM users WHERE id = ?', row.user_id);
   if (!user) return null;
   return { user, credential: row };
 }
@@ -234,34 +234,38 @@ export function sessionCookieHeaders(token, { maxAgeSeconds = config.sessionTtlH
 }
 
 /** Resolve req.user from a session cookie or an API-key bearer token. */
-export function attachUser(req, res, next) {
+export async function attachUser(req, res, next) {
   req.user = null;
   req.auth = null;
-  const authz = req.headers.authorization || '';
-  if (/^Bearer\s+/i.test(authz)) {
-    const bearer = authz.replace(/^Bearer\s+/i, '');
-    const found = userFromApiKey(bearer);
-    if (found) {
-      req.user = found.user;
-      req.auth = { kind: 'api_key', credentialId: found.credential.id, label: found.credential.label };
-      return next();
-    }
-  }
-  const cookies = parseCookies(req);
-  const token = cookies[SESSION_COOKIE];
-  if (token) {
-    const session = findSessionByToken(token);
-    if (session && !session.reason) {
-      const user = one('SELECT * FROM users WHERE id = ?', session.user_id);
-      if (user) {
-        req.user = user;
-        req.auth = { kind: 'session', sessionId: session.id, token };
-        touchSession(session.id);
+  try {
+    const authz = req.headers.authorization || '';
+    if (/^Bearer\s+/i.test(authz)) {
+      const bearer = authz.replace(/^Bearer\s+/i, '');
+      const found = await userFromApiKey(bearer);
+      if (found) {
+        req.user = found.user;
+        req.auth = { kind: 'api_key', credentialId: found.credential.id, label: found.credential.label };
         return next();
       }
     }
+    const cookies = parseCookies(req);
+    const token = cookies[SESSION_COOKIE];
+    if (token) {
+      const session = await findSessionByToken(token);
+      if (session && !session.reason) {
+        const user = await one('SELECT * FROM users WHERE id = ?', session.user_id);
+        if (user) {
+          req.user = user;
+          req.auth = { kind: 'session', sessionId: session.id, token };
+          await touchSession(session.id);
+          return next();
+        }
+      }
+    }
+    return next();
+  } catch (error) {
+    return next(error);
   }
-  return next();
 }
 
 export function requireUser(req, res, next) {
@@ -307,34 +311,31 @@ export function requireSameOrigin(req, res, next) {
 }
 
 /* ------------------------------------------------------------------ */
-/* rate limiting (in-memory sliding window)                            */
+/* rate limiting (atomic shared buckets; works across Vercel instances) */
 /* ------------------------------------------------------------------ */
 
-const buckets = new Map();
-
 export function rateLimit({ windowMs = 60_000, max = 20, key = 'default' } = {}) {
-  return (req, res, next) => {
-    const bucketKey = `${key}:${clientIp(req)}`;
-    const nowMs = Date.now();
-    const hits = (buckets.get(bucketKey) || []).filter((t) => nowMs - t < windowMs);
-    if (hits.length >= max) {
-      const retryAfter = Math.ceil((windowMs - (nowMs - hits[0])) / 1000);
-      res.setHeader('Retry-After', String(retryAfter));
-      audit({
-        event: 'rate_limit',
-        status: 'blocked',
-        ip: clientIp(req),
-        userAgent: req.headers['user-agent'],
-        detail: `${req.method} ${req.path}`,
-      });
-      return res.status(429).json({ error: 'Too many requests, slow down.', retryAfter });
+  return async (req, res, next) => {
+    try {
+      const ip = clientIp(req);
+      const bucketKey = `${key}:${ip}`;
+      const { hits, windowStart } = await consumeRateLimit(bucketKey, windowMs);
+      if (hits > max) {
+        const retryAfter = Math.max(1, Math.ceil((windowStart + windowMs - Date.now()) / 1000));
+        res.setHeader('Retry-After', String(retryAfter));
+        await audit({
+          event: 'rate_limit',
+          status: 'blocked',
+          ip,
+          userAgent: req.headers['user-agent'],
+          detail: `${req.method} ${req.path}`,
+        });
+        return res.status(429).json({ error: 'Too many requests, slow down.', retryAfter });
+      }
+      return next();
+    } catch (error) {
+      return next(error);
     }
-    hits.push(nowMs);
-    buckets.set(bucketKey, hits);
-    if (buckets.size > 5000) {
-      for (const [k, v] of buckets) if (!v.some((t) => nowMs - t < windowMs)) buckets.delete(k);
-    }
-    return next();
   };
 }
 
@@ -349,7 +350,7 @@ export async function createUser({ email, name, password }) {
   const normalized = normalizeEmail(email);
   const ts = now();
   const userId = id('user');
-  run(
+  await run(
     `INSERT INTO users (id, email, name, password_hash, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?)`,
     userId,

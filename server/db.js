@@ -4,14 +4,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import { now, id } from './lib/util.js';
 
-fs.mkdirSync(path.dirname(config.dbFile), { recursive: true });
-
-export const db = new DatabaseSync(config.dbFile);
-
-db.exec('PRAGMA journal_mode = WAL');
-db.exec('PRAGMA foreign_keys = ON');
-
-db.exec(`
+const schema = `
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
   email         TEXT NOT NULL UNIQUE,
@@ -23,8 +16,6 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TEXT
 );
 
--- "Credential systems": every way a user can prove who they are.
--- kind = password | api_key  (api keys are stored hashed, shown once)
 CREATE TABLE IF NOT EXISTS credentials (
   id           TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -40,7 +31,6 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id);
 
--- Login sessions (revocable, device-aware).
 CREATE TABLE IF NOT EXISTS sessions (
   id           TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -55,7 +45,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
 
--- Conversations ("sessions" in the product sense).
 CREATE TABLE IF NOT EXISTS chat_sessions (
   id            TEXT PRIMARY KEY,
   user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -80,6 +69,7 @@ CREATE TABLE IF NOT EXISTS messages (
   tool_call_id    TEXT,
   content         TEXT NOT NULL DEFAULT '',
   tool_calls      TEXT,
+  attachments     TEXT,
   provider        TEXT,
   model           TEXT,
   tokens_in       INTEGER NOT NULL DEFAULT 0,
@@ -88,8 +78,8 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(chat_session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, created_at DESC);
 
--- Recent searches (tool + user driven, per user, newest first).
 CREATE TABLE IF NOT EXISTS searches (
   id              TEXT PRIMARY KEY,
   user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -119,9 +109,10 @@ CREATE TABLE IF NOT EXISTS settings (
   user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   provider      TEXT NOT NULL DEFAULT 'local',
   model         TEXT NOT NULL DEFAULT 'blue-local-1',
+  mode          TEXT NOT NULL DEFAULT 'auto',
   temperature   REAL NOT NULL DEFAULT 0.7,
   system_prompt TEXT,
-  tools_enabled TEXT NOT NULL DEFAULT '["web_search","fetch_page","calculator","clock","memory","session_search","search_history"]',
+  tools_enabled TEXT NOT NULL DEFAULT '["web_search","deep_research","fetch_page","calculator","data_analysis","clock","memory","session_search","search_history"]',
   theme         TEXT NOT NULL DEFAULT 'blue',
   updated_at    TEXT NOT NULL
 );
@@ -138,33 +129,106 @@ CREATE TABLE IF NOT EXISTS auth_events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_auth_events_user ON auth_events(user_id, created_at DESC);
-`);
 
-/** Additive migrations for databases created by earlier versions. */
-function migrate() {
+-- Atomic shared rate limits work across serverless instances.
+CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket_key  TEXT NOT NULL,
+  window_start BIGINT NOT NULL,
+  hits        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_key, window_start)
+);
+`;
+
+export const databaseKind = config.databaseKind;
+export let db = null;
+let postgres = null;
+
+function statementsFromSchema() {
+  return schema
+    .replace(/^\s*--.*$/gm, '')
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+}
+
+function migrateSqlite() {
   const ensureColumn = (table, column, definition) => {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-    if (cols.length && !cols.some((c) => c.name === column)) {
+    if (cols.length && !cols.some((col) => col.name === column)) {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
   };
   ensureColumn('messages', 'name', 'TEXT');
   ensureColumn('messages', 'tool_call_id', 'TEXT');
+  ensureColumn('messages', 'attachments', 'TEXT');
   ensureColumn('messages', 'latency_ms', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('searches', 'pinned', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('chat_sessions', 'pinned', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('settings', 'mode', "TEXT NOT NULL DEFAULT 'auto'");
 }
-migrate();
+
+async function initialize() {
+  if (config.databaseUrl) {
+    const { neon } = await import('@neondatabase/serverless');
+    postgres = neon(config.databaseUrl, { fetchOptions: { cache: 'no-store' } });
+    for (const statement of statementsFromSchema()) await postgres.query(statement, []);
+    await postgres.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments TEXT', []);
+    await postgres.query("ALTER TABLE settings ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'auto'", []);
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(config.dbFile), { recursive: true });
+  db = new DatabaseSync(config.dbFile);
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec(schema);
+  migrateSqlite();
+}
+
+// The SQLite schema initializes synchronously for local installs. Postgres DDL
+// is lazy and awaited by every query so cold-start requests never race it.
+export const ready = initialize();
+
+function postgresSql(sql) {
+  let index = 0;
+  return String(sql).replace(/\?/g, () => `$${++index}`);
+}
+
+async function query(sql, params = []) {
+  await ready;
+  if (db) return db.prepare(sql).all(...params);
+  return postgres.query(postgresSql(sql), params);
+}
+
+export async function one(sql, ...params) {
+  await ready;
+  if (db) return db.prepare(sql).get(...params) ?? null;
+  const rows = await postgres.query(postgresSql(sql), params);
+  return rows[0] ?? null;
+}
+
+export async function all(sql, ...params) {
+  return query(sql, params);
+}
+
+export async function run(sql, ...params) {
+  await ready;
+  if (db) return db.prepare(sql).run(...params);
+  return postgres.query(postgresSql(sql), params);
+}
 
 export const DEFAULT_SETTINGS = {
   provider: 'local',
   model: 'blue-local-1',
+  mode: 'auto',
   temperature: 0.7,
   system_prompt: null,
   tools_enabled: [
     'web_search',
+    'deep_research',
     'fetch_page',
     'calculator',
+    'data_analysis',
     'clock',
     'memory',
     'session_search',
@@ -174,15 +238,11 @@ export const DEFAULT_SETTINGS = {
 };
 
 /* ------------------------------------------------------------------ */
-/* helpers                                                             */
+/* event log and shared rate limits                                    */
 /* ------------------------------------------------------------------ */
 
-export const one = (sql, ...params) => db.prepare(sql).get(...params) ?? null;
-export const all = (sql, ...params) => db.prepare(sql).all(...params);
-export const run = (sql, ...params) => db.prepare(sql).run(...params);
-
-export function audit({ userId = null, email = null, event, status = 'ok', ip = '', userAgent = '', detail = '' }) {
-  run(
+export async function audit({ userId = null, email = null, event, status = 'ok', ip = '', userAgent = '', detail = '' }) {
+  await run(
     `INSERT INTO auth_events (id, user_id, email, event, status, ip, user_agent, detail, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     id('evt'),
@@ -197,17 +257,45 @@ export function audit({ userId = null, email = null, event, status = 'ok', ip = 
   );
 }
 
+let rateLimitOperations = 0;
+
+export async function consumeRateLimit(bucketKey, windowMs) {
+  const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
+  const row = await one(
+    `INSERT INTO rate_limits (bucket_key, window_start, hits) VALUES (?, ?, 1)
+     ON CONFLICT (bucket_key, window_start) DO UPDATE SET hits = rate_limits.hits + 1
+     RETURNING hits`,
+    bucketKey,
+    windowStart,
+  );
+  rateLimitOperations += 1;
+  if (rateLimitOperations % 100 === 0) {
+    await run('DELETE FROM rate_limits WHERE window_start < ?', Date.now() - 24 * 60 * 60 * 1000);
+  }
+  return { hits: Number(row?.hits || 0), windowStart };
+}
+
 /* ------------------------------------------------------------------ */
 /* settings                                                            */
 /* ------------------------------------------------------------------ */
 
-export function getSettings(userId) {
-  const row = one('SELECT * FROM settings WHERE user_id = ?', userId);
-  if (!row) return { ...DEFAULT_SETTINGS, user_id: userId };
+const safeArray = (json, fallback) => {
+  try {
+    const parsed = typeof json === 'string' ? JSON.parse(json) : json;
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+export async function getSettings(userId) {
+  const row = await one('SELECT * FROM settings WHERE user_id = ?', userId);
+  if (!row) return { ...DEFAULT_SETTINGS, tools_enabled: [...DEFAULT_SETTINGS.tools_enabled], user_id: userId };
   return {
     user_id: userId,
     provider: row.provider,
     model: row.model,
+    mode: row.mode || 'auto',
     temperature: row.temperature,
     system_prompt: row.system_prompt,
     tools_enabled: safeArray(row.tools_enabled, DEFAULT_SETTINGS.tools_enabled),
@@ -216,32 +304,26 @@ export function getSettings(userId) {
   };
 }
 
-function safeArray(json, fallback) {
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-export function saveSettings(userId, patch = {}) {
-  const current = getSettings(userId);
+export async function saveSettings(userId, patch = {}) {
+  const current = await getSettings(userId);
   const next = {
     provider: patch.provider ?? current.provider,
     model: patch.model ?? current.model,
+    mode: ['auto', 'reasoning', 'research', 'coding', 'planning', 'writing'].includes(patch.mode)
+      ? patch.mode
+      : current.mode,
     temperature: patch.temperature ?? current.temperature,
-    system_prompt:
-      patch.system_prompt === undefined ? current.system_prompt : patch.system_prompt,
+    system_prompt: patch.system_prompt === undefined ? current.system_prompt : patch.system_prompt,
     tools_enabled: Array.isArray(patch.tools_enabled) ? patch.tools_enabled : current.tools_enabled,
     theme: patch.theme ?? current.theme,
   };
-  run(
-    `INSERT INTO settings (user_id, provider, model, temperature, system_prompt, tools_enabled, theme, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  await run(
+    `INSERT INTO settings (user_id, provider, model, mode, temperature, system_prompt, tools_enabled, theme, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id) DO UPDATE SET
        provider = excluded.provider,
        model = excluded.model,
+       mode = excluded.mode,
        temperature = excluded.temperature,
        system_prompt = excluded.system_prompt,
        tools_enabled = excluded.tools_enabled,
@@ -250,6 +332,7 @@ export function saveSettings(userId, patch = {}) {
     userId,
     next.provider,
     next.model,
+    next.mode,
     next.temperature,
     next.system_prompt,
     JSON.stringify(next.tools_enabled),
@@ -263,7 +346,7 @@ export function saveSettings(userId, patch = {}) {
 /* searches (recent searches feature)                                  */
 /* ------------------------------------------------------------------ */
 
-export function recordSearch({
+export async function recordSearch({
   userId,
   chatSessionId = null,
   query,
@@ -274,7 +357,7 @@ export function recordSearch({
   const clean = String(query || '').trim();
   if (!clean) return null;
   const rowId = id('srch');
-  run(
+  await run(
     `INSERT INTO searches (id, user_id, chat_session_id, query, provider, result_count, results, source, pinned, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
     rowId,
@@ -290,7 +373,7 @@ export function recordSearch({
   return rowId;
 }
 
-export function recentSearches(userId, { limit = 40, q = '', pinnedOnly = false } = {}) {
+export async function recentSearches(userId, { limit = 40, q = '', pinnedOnly = false } = {}) {
   const params = [userId];
   let sql = 'SELECT * FROM searches WHERE user_id = ?';
   if (pinnedOnly) sql += ' AND pinned = 1';
@@ -300,7 +383,7 @@ export function recentSearches(userId, { limit = 40, q = '', pinnedOnly = false 
   }
   sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
   params.push(Math.min(Number(limit) || 40, 200));
-  return all(sql, ...params).map((row) => ({
+  return (await all(sql, ...params)).map((row) => ({
     id: row.id,
     query: row.query,
     provider: row.provider,
@@ -313,37 +396,38 @@ export function recentSearches(userId, { limit = 40, q = '', pinnedOnly = false 
   }));
 }
 
-export function deleteSearch(userId, searchId) {
-  run('DELETE FROM searches WHERE id = ? AND user_id = ?', searchId, userId);
+export async function deleteSearch(userId, searchId) {
+  await run('DELETE FROM searches WHERE id = ? AND user_id = ?', searchId, userId);
 }
 
-export function clearSearches(userId) {
-  run('DELETE FROM searches WHERE user_id = ? AND pinned = 0', userId);
+export async function clearSearches(userId) {
+  await run('DELETE FROM searches WHERE user_id = ? AND pinned = 0', userId);
 }
 
-export function toggleSearchPin(userId, searchId) {
-  const row = one('SELECT pinned FROM searches WHERE id = ? AND user_id = ?', searchId, userId);
-  if (!row) return null;
-  run('UPDATE searches SET pinned = ? WHERE id = ? AND user_id = ?', row.pinned ? 0 : 1, searchId, userId);
-  return one('SELECT pinned FROM searches WHERE id = ?', searchId).pinned === 1;
+export async function toggleSearchPin(userId, searchId) {
+  const row = await one(
+    `UPDATE searches SET pinned = CASE WHEN pinned = 1 THEN 0 ELSE 1 END
+     WHERE id = ? AND user_id = ? RETURNING pinned`,
+    searchId,
+    userId,
+  );
+  return row ? !!row.pinned : null;
 }
 
 /* ------------------------------------------------------------------ */
 /* memories                                                            */
 /* ------------------------------------------------------------------ */
 
-export function rememberMemory(userId, key, value, source = 'agent') {
+export async function rememberMemory(userId, key, value, source = 'agent') {
   const k = String(key || '').trim().slice(0, 120);
   if (!k) return null;
-  const existing = one('SELECT id FROM memories WHERE user_id = ? AND key = ?', userId, k);
-  if (existing) {
-    run('UPDATE memories SET value = ?, source = ?, updated_at = ? WHERE id = ?', String(value).slice(0, 2000), source, now(), existing.id);
-    return existing.id;
-  }
-  const memId = id('mem');
-  run(
-    'INSERT INTO memories (id, user_id, key, value, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    memId,
+  const row = await one(
+    `INSERT INTO memories (id, user_id, key, value, source, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (user_id, key) DO UPDATE SET
+       value = excluded.value, source = excluded.source, updated_at = excluded.updated_at
+     RETURNING id`,
+    id('mem'),
     userId,
     k,
     String(value).slice(0, 2000),
@@ -351,25 +435,25 @@ export function rememberMemory(userId, key, value, source = 'agent') {
     now(),
     now(),
   );
-  return memId;
+  return row?.id ?? null;
 }
 
-export function listMemories(userId) {
+export async function listMemories(userId) {
   return all('SELECT * FROM memories WHERE user_id = ? ORDER BY updated_at DESC', userId);
 }
 
-export function forgetMemory(userId, keyOrId) {
-  run('DELETE FROM memories WHERE user_id = ? AND (id = ? OR key = ?)', userId, keyOrId, keyOrId);
+export async function forgetMemory(userId, keyOrId) {
+  await run('DELETE FROM memories WHERE user_id = ? AND (id = ? OR key = ?)', userId, keyOrId, keyOrId);
 }
 
 /* ------------------------------------------------------------------ */
 /* chat sessions                                                       */
 /* ------------------------------------------------------------------ */
 
-export function createChatSession(userId, { title = 'New chat', provider = 'local', model = 'blue-local-1', temperature = 0.7, system_prompt = null } = {}) {
+export async function createChatSession(userId, { title = 'New chat', provider = 'local', model = 'blue-local-1', temperature = 0.7, system_prompt = null } = {}) {
   const sid = id('chat');
   const ts = now();
-  run(
+  await run(
     `INSERT INTO chat_sessions (id, user_id, title, provider, model, temperature, system_prompt, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     sid,
@@ -385,7 +469,7 @@ export function createChatSession(userId, { title = 'New chat', provider = 'loca
   return one('SELECT * FROM chat_sessions WHERE id = ?', sid);
 }
 
-export function listChatSessions(userId, { includeArchived = false, q = '' } = {}) {
+export async function listChatSessions(userId, { includeArchived = false, q = '' } = {}) {
   const params = [userId];
   let sql = `
     SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.chat_session_id = s.id) AS message_count
@@ -400,14 +484,14 @@ export function listChatSessions(userId, { includeArchived = false, q = '' } = {
   return all(sql, ...params);
 }
 
-export function getChatSession(userId, sessionId) {
+export async function getChatSession(userId, sessionId) {
   return one('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?', sessionId, userId);
 }
 
-export function touchChatSession(sessionId, { title, provider, model } = {}) {
-  const current = one('SELECT * FROM chat_sessions WHERE id = ?', sessionId);
-  if (!current) return;
-  run(
+export async function touchChatSession(sessionId, { title, provider, model } = {}) {
+  const current = await one('SELECT * FROM chat_sessions WHERE id = ?', sessionId);
+  if (!current) return null;
+  await run(
     'UPDATE chat_sessions SET title = ?, provider = ?, model = ?, updated_at = ? WHERE id = ?',
     title ?? current.title,
     provider ?? current.provider,
@@ -415,9 +499,10 @@ export function touchChatSession(sessionId, { title, provider, model } = {}) {
     now(),
     sessionId,
   );
+  return one('SELECT * FROM chat_sessions WHERE id = ?', sessionId);
 }
 
-export function addMessage({
+export async function addMessage({
   sessionId,
   userId,
   role,
@@ -425,6 +510,7 @@ export function addMessage({
   toolCallId = null,
   content = '',
   toolCalls = null,
+  attachments = null,
   provider = null,
   model = null,
   tokensIn = 0,
@@ -432,9 +518,9 @@ export function addMessage({
   latencyMs = 0,
 }) {
   const mid = id('msg');
-  run(
-    `INSERT INTO messages (id, chat_session_id, user_id, role, name, tool_call_id, content, tool_calls, provider, model, tokens_in, tokens_out, latency_ms, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  await run(
+    `INSERT INTO messages (id, chat_session_id, user_id, role, name, tool_call_id, content, tool_calls, attachments, provider, model, tokens_in, tokens_out, latency_ms, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     mid,
     sessionId,
     userId,
@@ -443,6 +529,7 @@ export function addMessage({
     toolCallId,
     content,
     toolCalls ? JSON.stringify(toolCalls) : null,
+    attachments ? JSON.stringify(attachments) : null,
     provider,
     model,
     tokensIn,
@@ -450,13 +537,13 @@ export function addMessage({
     latencyMs,
     now(),
   );
-  run('UPDATE chat_sessions SET updated_at = ? WHERE id = ?', now(), sessionId);
+  await run('UPDATE chat_sessions SET updated_at = ? WHERE id = ?', now(), sessionId);
   return one('SELECT * FROM messages WHERE id = ?', mid);
 }
 
-export function listMessages(sessionId, userId, { limit = 500 } = {}) {
+export async function listMessages(sessionId, userId, { limit = 500 } = {}) {
   return all(
-    `SELECT * FROM messages WHERE chat_session_id = ? AND user_id = ? ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+    `SELECT * FROM messages WHERE chat_session_id = ? AND user_id = ? ORDER BY created_at ASC, id ASC LIMIT ?`,
     sessionId,
     userId,
     limit,

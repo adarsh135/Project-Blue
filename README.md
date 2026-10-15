@@ -1,10 +1,10 @@
 # ◈ Project Blue
 
-**A self-hosted agentic AI assistant — with a real credential system, sessions, durable memory and per-user recent searches.**
+**A self-hosted, agentic AI assistant — with secure accounts, multimodal chat, deep research, durable memory and per-user search history.**
 
-Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
+Blue is an inspectable Node.js assistant you can run locally or deploy to Vercel. It works offline with SQLite and its deterministic local engine, and uses Neon Postgres plus your chosen model/search providers for a durable, hosted deployment.
 
-![status](https://img.shields.io/badge/tests-44%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-automated-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -19,9 +19,13 @@ Most "AI chat" repos are a thin wrapper around one vendor's SDK. Project Blue is
 | 💬 **Conversations** | Persistent chats with derived titles, pin/archive, full-text search across *and* inside conversations |
 | 🔎 **Recent searches** | Every web search the agent (or you) runs is recorded per user with provider, result count, snippets, pinning and day grouping |
 | 🧠 **Memory** | Durable `key → value` facts the agent writes when you say "remember…", injected into every future system prompt |
-| 🧰 **Agent loop** | Streaming tool-calling loop: `web_search`, `fetch_page`, `calculator`, `clock`, `memory`, `session_search`, `search_history` |
-| 🔌 **Any model** | OpenAI-compatible, Anthropic, Gemini, Ollama — or the built-in **Blue Local Engine** that runs with no key at all |
-| 🌗 **Real UI** | Dark/light theme, streaming markdown with copyable code blocks, collapsible tool-call cards, recent-searches rail, memory and account panels |
+| 🧰 **Agent loop** | Bounded streaming tool calls: web search, multi-query deep research, safe page reading, precise maths, CSV statistics/charts, memory, and chat/search-history lookup |
+| 🧠 **Work modes** | Reasoning summaries, research, coding, planning and writing prompts; customizable system prompt; guardrails against fabricated actions and private chain-of-thought |
+| 🖼️ **Multimodal input** | Text/code/CSV, images, PDFs, audio and video attachments, routed to providers that support each format; browser dictation and read-aloud where available |
+| 🔌 **Any model** | OpenAI-compatible, Anthropic, Gemini, Ollama — or the built-in **Blue Local Engine** that runs with no model key |
+| 🌐 **Research & analysis** | Source-linked research briefs and deterministic local CSV summaries with missing-value checks, grouped data and chart rendering |
+| ☁️ **Deployable** | SQLite for local installs; Neon/Postgres for durable serverless data on Vercel, with a single Express function and static assets |
+| 🌗 **Real UI** | Dark/light theme, copyable code, sandboxed HTML previews, collapsible tool cards, attachment chips, search rail, memory and account panels |
 
 ---
 
@@ -50,7 +54,21 @@ cp .env.example .env
 #   TAVILY_API_KEY=… / BRAVE_API_KEY=… / SERPER_API_KEY=…
 ```
 
-Blue picks the provider automatically; per-account you can switch provider, model, temperature, system prompt and enabled tools in **Settings**.
+Blue picks the provider automatically; per-account you can switch provider, model, temperature, work mode, system prompt and enabled tools in **Settings**.
+
+---
+
+## Deploy on Vercel
+
+The repository includes a Vercel Node.js Function entry point (`api/index.js`) and `vercel.json` routing for the Express app, SSE chat stream and browser assets. Local SQLite is intentionally **not** used for production data on Vercel because function filesystems are ephemeral.
+
+1. Import this repository into Vercel and use **Node.js 22** (the version required by `package.json`). No frontend build command or output directory is needed.
+2. Provision a Neon Postgres database (for example, through the Vercel Marketplace) and add its pooled connection string as `DATABASE_URL` or `POSTGRES_URL`.
+3. Add `BLUE_SESSION_SECRET` with at least 32 characters. Generate one with `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"` and keep the same value across deployments/environments where sessions should remain valid.
+4. Add at least one model provider key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`) and, for reliable current research, a search key (`TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY`). Blue can run without a model key, but its offline planner is intentionally limited.
+5. Redeploy, then visit the Vercel domain and create an account. Configure all credentials in Vercel's Environment Variables; never commit them to the repo.
+
+`vercel.json` sets a 60-second function duration and includes the `public/` assets used by Express. Confirm that duration is available on your Vercel plan. The database URL and session secret are required by the app at production cold start; a missing or invalid value fails early rather than silently losing user data. See [docs/VERCEL.md](docs/VERCEL.md) for storage, environment, streaming and troubleshooting notes.
 
 ---
 
@@ -77,7 +95,7 @@ Blue picks the provider automatically; per-account you can switch provider, mode
                          └───────────────▲──────────────────────┬──────────────────┘
                                          │ fetch/SSE            │
 ┌────────────────────────────────────────┴──────────────────────▼──────────────────┐
-│ server/index.js — express 5                                                      │
+│ server/app.js — Express 5 app (shared by local server and Vercel function)        │
 │  security headers · CSP · JSON body limit · request log · auth middleware         │
 │                                                                                  │
 │  /api/auth/*  auth.routes.js      register · login · logout · me · password ·     │
@@ -92,17 +110,17 @@ Blue picks the provider automatically; per-account you can switch provider, mode
 │    ├── tools.js        tool schemas + execution + result rendering                 │
 │    └── math.js         sandboxed arithmetic parser (no eval)                       │
 │                                                                                  │
-│  db.js — node:sqlite schema, migrations, queries                                  │
+│  db.js — async SQL layer, migrations and persistent rate limits                  │
 │  auth.js — scrypt, sessions, API keys, CSRF, rate limiting                        │
 └──────────────────────────────────────┬──────────────────────────────────────────┘
                                        │
-                                 data/blue.db (SQLite, WAL)
+                 local: data/blue.db (SQLite/WAL) · Vercel: Neon/Postgres
 ```
 
 ### The agent loop, concretely
 
 1. The user's turn is persisted, the chat is titled from the first message.
-2. Context is assembled: custom/system prompt + stored memories + the 8 most recent searches + up to 400 stored messages.
+2. Context is assembled from the system/custom prompt, stored memories, recent searches and a bounded conversation history (160 messages and 240,000 characters by default).
 3. The provider streams tokens. `text` events go straight to the browser; `tool_call` events are queued.
 4. If the model asked for tools, the assistant turn is persisted *with its tool calls*, each tool runs, and every result is persisted as a `tool` message.
 5. Results are fed back and the model streams again — up to `BLUE_MAX_TOOL_ROUNDS` (default 4) rounds, so no runaway loops.
@@ -174,10 +192,10 @@ curl -X POST localhost:4000/api/chat \
 * **API keys** — `blue_sk_<prefix>_<secret>`; only the SHA-256 of the secret is stored, the plaintext is shown exactly once, comparison is timing-safe, and keys can be revoked per key.
 * **Rate limiting** — login/register limits per IP, per-user message throughput cap.
 * **Isolation** — every query is scoped by `user_id`; a foreign chat id returns 404, never data.
-* **Headers** — strict CSP (`default-src 'self'`), `nosniff`, referrer policy, HSTS + `X-Frame-Options` in production. Markdown is escaped before formatting, so model or web output cannot inject markup.
-* **Tools** — the calculator is a hand-written recursive-descent parser (no `eval`), `fetch_page` only allows `http(s)`, and the schema keeps Gemini/Anthropic happy without loosening validation.
+* **Headers** — strict CSP (`default-src 'self'`), `nosniff`, referrer policy, HSTS + `X-Frame-Options` in production. Markdown text is escaped; HTML previews use a sandboxed opaque-origin iframe with scripts, links and external requests disabled.
+* **Attachments & tools** — per-file, per-turn and request-size validation; provider-specific modality checks; CSV is parsed locally without executing uploaded code. The calculator is a recursive-descent parser (no `eval`), and `fetch_page` only allows `http(s)` URLs.
 
-Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=https://…`), set `NODE_ENV=production`, and back up `data/blue.db`.
+Deployment checklist: for a local server, keep `data/` backed up and set `BLUE_SESSION_SECRET` if you need a secret shared across replicas. For Vercel, use Neon/Postgres and a stable `BLUE_SESSION_SECRET` as described above; do not treat `/tmp` or SQLite files as durable hosted storage.
 
 ---
 
@@ -186,10 +204,13 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` / `HOST` | `4000` / `0.0.0.0` | listen address |
-| `BLUE_SESSION_SECRET` | generated into `data/.session-secret` | session signing/derivation secret |
+| `BLUE_SESSION_SECRET` | generated into `data/.session-secret` locally | stable session secret; required (32+ characters) on Vercel production |
+| `DATABASE_URL` / `POSTGRES_URL` | unset | Neon/Postgres connection; local default is SQLite, Vercel production requires Postgres |
 | `SESSION_TTL_HOURS` | `168` | login session lifetime |
-| `BLUE_DATA_DIR` | `./data` | SQLite + secret location |
+| `BLUE_DATA_DIR` | `./data` locally; `/tmp/project-blue` on Vercel | SQLite + secret location (ephemeral on Vercel; do not use for production data) |
 | `BLUE_MAX_TOOL_ROUNDS` | `4` | agent loop cap per turn |
+| `BLUE_MAX_HISTORY_MESSAGES` | `160` | maximum stored messages included in a turn |
+| `BLUE_MAX_CONTEXT_CHARS` | `240000` | bounded prompt/history character budget |
 | `BLUE_FORCE_LOCAL_ENGINE` | `false` | ignore provider keys, always use the offline engine |
 | `BLUE_SEARCH_OFFLINE` | `false` | never make outbound search requests |
 | `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
@@ -201,46 +222,40 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 ## Tests
 
 ```bash
-npm test        # 44 tests, ~8s, no network required
+npm test        # 57 tests, ~10s, no network required
 ```
 
-* `tests/math.test.js` — the calculator, including rejected code-execution attempts
-* `tests/markdown.test.js` — escaping/XSS, tables, links, fenced code
-* `tests/local-engine.test.js` — intent routing, tool selection, answer synthesis, no stale tool output
-* `tests/api.test.js` — boots the real server on a random port: registration validation, identical login failures, CSRF blocking, API-key auth, per-user isolation, search recording/pinning, session revocation, password change
-* `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
-* `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
+* `tests/math.test.js` — exact arithmetic and rejected code-execution attempts
+* `tests/markdown.test.js` — escaping/XSS, links, code fences and sandboxed HTML-preview lifecycle
+* `tests/capabilities.test.js` — attachment validation, provider-specific multimodal payloads, CSV parsing/analysis and work-mode prompts
+* `tests/local-engine.test.js` — intent routing, tool selection, answer synthesis and no stale tool output
+* `tests/api.test.js` — live HTTP auth/session/API-key, CSRF, user isolation, search/memory, settings and CSV-attachment coverage
+* `tests/ui.test.js` — jsdom browser flow: register → stream a turn → attach/remove/analyze a CSV → history reload → theme
+* `tests/deployment.test.js` — Vercel routing/entry point, production-env fail-fast checks, API health and static-asset smoke test
+* `tests/frontend-contract.test.js` — DOM IDs, view sections, CSP-safe HTML and stylesheet tokens
 
 ---
 
 ## Project layout
 
 ```
+api/index.js          Vercel Node.js Function entry point (exports the Express app)
 server/
-  index.js            express app, headers, static hosting, error handling
-  config.js           env + .env loading, provider discovery
-  db.js               schema, migrations, all queries
-  auth.js             scrypt, sessions, API keys, CSRF, rate limiting
-  routes/auth.routes.js  credential + account endpoints
-  routes/api.routes.js   product endpoints incl. the SSE chat stream
-  agent/agent.js      the agent loop
-  agent/prompt.js     system prompt construction
-  agent/providers.js  streaming adapters per provider
-  agent/local-engine.js  offline deterministic engine
-  agent/tools.js      tool schemas, execution, rendering
-  agent/math.js       sandboxed arithmetic
+  app.js               shared Express app, security headers, API and static hosting
+  index.js             standalone local listener and session cleanup
+  config.js            environment loading, database/provider discovery
+  db.js                async SQLite/Neon Postgres layer, schema and rate limits
+  auth.js              scrypt, sessions, API keys, CSRF, rate limiting
+  routes/               authentication and product API endpoints
+  agent/                 mode prompts, providers, tools and local fallback engine
 public/
-  index.html          auth screen + app shell (all views)
-  css/app.css         design tokens, dark/light themes, components
-  js/app.js           boot, auth, routing, event bus wiring
-  js/chat.js          transcript rendering + SSE streaming
-  js/panels.js        conversations, searches, memory, tools, settings, account
-  js/api.js           fetch wrapper (cookies + CSRF) and SSE reader
-  js/markdown.js      XSS-safe markdown renderer
-  js/ui.js            DOM helpers, toasts, modals
-  js/store.js         client state + event bus
-tests/                44 tests
-docs/ARCHITECTURE.md  data model, flows, SSE protocol
+  index.html            auth screen + app shell (all views)
+  css/app.css           themes, composer, attachments and artifact preview styles
+  js/                   frontend modules for chat, panels, state, API and markdown
+tests/                  57 tests
+docs/ARCHITECTURE.md    data model, flows and SSE protocol
+docs/VERCEL.md          deployment steps, secrets, persistence and troubleshooting
+vercel.json             serverless rewrite, function duration and included assets
 ```
 
 ---
@@ -248,10 +263,8 @@ docs/ARCHITECTURE.md  data model, flows, SSE protocol
 ## Roadmap
 
 - [ ] Tool plugins loaded from a `tools/` folder (bring your own tools)
-- [ ] File attachments and vision input
 - [ ] Multi-user spaces, sharing and read-only links
 - [ ] Background jobs (scheduled searches, digests)
-- [ ] Postgres adapter for horizontal scale
 - [ ] Docker image
 
 ## License

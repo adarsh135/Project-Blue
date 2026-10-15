@@ -219,6 +219,22 @@ function wireShell() {
     await panels.saveSettings({ model: event.target.value });
     updateTopbarSub();
   });
+  on('#mode-select', 'change', async (event) => {
+    try {
+      await panels.saveSettings({ mode: event.target.value });
+    } catch (error) {
+      toast(error.message || 'Could not save work mode', 'err');
+    }
+  });
+  on('#attach-btn', 'click', () => $('#attachment-input')?.click());
+  on('#attachment-input', 'change', async (event) => {
+    try {
+      await chat.addFiles([...event.target.files]);
+    } finally {
+      event.target.value = '';
+    }
+  });
+  on('#voice-btn', 'click', dictateIntoComposer);
 
   // searches view
   on('#search-run', 'click', async () => {
@@ -316,6 +332,8 @@ function wireShell() {
     const streaming = state.streaming;
     $('#send-btn').style.display = streaming ? 'none' : 'inline-flex';
     $('#stop-btn').style.display = streaming ? 'inline-flex' : 'none';
+    $('#attach-btn').disabled = streaming;
+    $('#attachment-input').disabled = streaming;
   });
   subscribe('searches-dirty', debounce(() => panels.loadSearches().catch(() => {}), 400));
   subscribe('sessions-dirty', debounce(() => panels.loadSessions().catch(() => {}), 300));
@@ -323,6 +341,42 @@ function wireShell() {
 
 function wireConversationInteractions() {
   // suggestion buttons inside the welcome card are wired when rendered
+}
+
+function dictateIntoComposer() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const button = $('#voice-btn');
+  if (!Recognition) {
+    toast('Voice dictation is not available in this browser. You can still attach an audio clip with a multimodal model.', 'err');
+    return;
+  }
+  const recognition = new Recognition();
+  recognition.lang = navigator.language || 'en-US';
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  button.disabled = true;
+  button.textContent = '🎙 Listening…';
+  recognition.onresult = (event) => {
+    const transcript = [...event.results].map((result) => result[0]?.transcript || '').join(' ').trim();
+    const input = $('#input');
+    input.value = [input.value.trim(), transcript].filter(Boolean).join(' ');
+    autoGrow(input);
+    input.focus();
+  };
+  recognition.onerror = (event) => {
+    if (!['no-speech', 'aborted'].includes(event.error)) toast(`Dictation failed: ${event.error}`, 'err');
+  };
+  recognition.onend = () => {
+    button.disabled = false;
+    button.textContent = '🎙 Dictate';
+  };
+  try {
+    recognition.start();
+  } catch {
+    button.disabled = false;
+    button.textContent = '🎙 Dictate';
+    toast('Could not start browser dictation. Check microphone permission.', 'err');
+  }
 }
 
 function applyTheme(theme) {
@@ -432,6 +486,7 @@ async function signOut() {
   } catch {
     /* ignore */
   }
+  chat.clearPendingAttachments();
   state.user = null;
   state.currentSessionId = null;
   state.messages = [];

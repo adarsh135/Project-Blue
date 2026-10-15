@@ -48,6 +48,13 @@ test('no inline event handlers or inline scripts (CSP compatibility)', () => {
   assert.ok(!/\son[a-z]+="/.test(html), 'inline on* handlers are blocked by CSP');
 });
 
+test('mobile composer has a safe-area layout and touch-sized controls', () => {
+  const css = fs.readFileSync(path.join(root, 'public/css/app.css'), 'utf8');
+  assert.match(css, /@media \(max-width: 600px\)/);
+  assert.match(css, /safe-area-inset-bottom/);
+  assert.match(css, /\.composer-bar button, \.composer-tools button \{ min-height: 38px; \}/);
+});
+
 test('CSS defines the theme tokens the app relies on', () => {
   const css = fs.readFileSync(path.join(root, 'public/css/app.css'), 'utf8');
   for (const token of ['--bg:', '--panel:', '--text:', '--accent:', '--line:']) {
