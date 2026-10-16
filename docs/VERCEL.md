@@ -1,66 +1,55 @@
-# Deploy Project Blue on Vercel
+# Public Vercel deployment with visitor-owned AI keys
 
-Project Blue's Vercel path is a Node.js Function that exports the existing Express app. `vercel.json` rewrites site and API routes to `api/index.js`; Express then serves both the API and the `public/` frontend. The local `server/index.js` listener is not imported by the function.
+These instructions describe **public BYOK mode** on this branch. They supersede the README's older self-hosted instruction to add owner model/search keys. Do not set owner AI or search keys on a public deployment.
 
-For automatic Git deployments, use Vercel Dashboard → **New Project** to import this GitHub repository and enable the Git integration. Vercel can then create Preview deployments for branch pushes and pull requests; merges to the project's configured production branch create Production deployments. Keep the repository's default production branch (usually `main`) selected, and use non-production branches for review. Adding the Git integration and choosing the production branch are account/project settings and cannot be done from this repository alone.
+## Branch and deployment settings
 
-## 1. Create the Vercel project
+1. Review and merge the BYOK pull request into `arena/bd6d01f4-project-blue` before deploying that branch. The implementation branch is `byok/public-vercel-request-keys`; it may be used as an isolated Vercel Preview for validation. No deployment or merge is performed by this change.
+2. In Vercel, import `adarsh135/Project-Blue`. Explicitly choose the reviewed branch as the project's Production Branch; do not assume Vercel selects it automatically. Use Node.js 22 (at least 22.5). There is no frontend build command or output directory. Keep `api/index.js` and `vercel.json`.
+3. Provision a Neon Postgres database. Set `DATABASE_URL` (pooled Neon connection string) or `POSTGRES_URL` in the appropriate Vercel environment. Never use SQLite or `/tmp` for durable Vercel data. Database setup/migrations run at function cold start, so check migration permissions and cold-start latency.
+4. Set `BLUE_SESSION_SECRET` to a stable random value of at least 32 characters. Generate it locally with `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"`. Keep it secret and stable across replicas.
+5. Set `BLUE_PUBLIC_BYOK=true` explicitly in both Production and Preview. Public mode also defaults on whenever `VERCEL` is set. **Do not set it to false on an internet-facing deployment.** `false` is a deliberate return to trusted, self-hosted mode, which may use owner environment credentials and allows the original network tools.
+6. Remove `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY`, `OPENAI_BASE_URL`, and `OLLAMA_BASE_URL` from public deployment settings. Public mode ignores these even if accidentally configured. Optional model-name variables (`OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`) select defaults only; choose currently supported models for your visitors. Old model aliases may no longer exist.
+7. Redeploy manually after environment changes, then validate in an isolated Preview with disposable, restricted provider credentials. Keep request-header/body capture disabled in Vercel logging, proxies, analytics and error monitoring. The application never intentionally logs the provider-key header, but infrastructure operators are part of the trust boundary.
 
-1. Import `adarsh135/Project-Blue` into Vercel.
-2. Use the repository root as the project root, select the **Other** framework preset, and use Node.js **22**. The required version is declared in `package.json`.
-3. Do not configure a frontend build command or output directory. Vercel builds the Node function from `api/index.js`; `vercel.json` includes `public/**` in the function bundle.
-4. Keep the repository's `vercel.json` rewrite in place. It routes `/`, `/api/*`, `/js/*`, and `/css/*` through the same Express app.
+`vercel.json` requests a 60-second function duration. Confirm plan support; the provider request timeout is 45 seconds and database/tool/multiple-round overhead can still exceed the total function duration. Large attachment requests remain subject to Vercel's payload limit as well as the app's 4 MiB request and 2 MiB attachment limits.
 
-## 2. Configure durable production storage
+## Visitor flow
 
-Vercel functions have an ephemeral filesystem. SQLite is the local development default and is not a production Vercel datastore. Provision a Neon Postgres database and set one of these Vercel environment variables:
+Create an account or sign in. The page shows a password field labeled **Your AI provider key (this tab only)**. Enter a key issued to you by OpenAI, Anthropic or Google Gemini. Choose the matching provider and a model available to that key in Settings, then chat. The offline Blue Local Engine remains available without a provider key when selected explicitly.
 
-- `DATABASE_URL` (preferred), or
-- `POSTGRES_URL` (also accepted).
+The key is held in tab JavaScript memory and sent only as `x-blue-provider-key` on chat requests. It is not included in chat JSON, model prompts, saved settings, cookies, localStorage, sessionStorage or SQL. Clear key, page navigation/reload, or logout removes it from the UI's memory. Password fields may still be inspected by the browser user; this is not a vault. Do not paste keys into chat or upload them as attachments: ordinary chat/attachment content is intentionally stored.
 
-Use the Neon connection string supplied for serverless/HTTP use. The schema and additive Postgres migrations are initialized automatically when the function starts. User accounts, sessions, chats, attachments, memories, search history and shared rate limits are stored in Postgres.
+The HTTPS application server must see the key transiently to call the selected provider. This is **not** end-to-end encryption and visitors must trust the deployment operator and its logging infrastructure. No key validation call occurs on entry; provider authentication and quota are checked when a chat request is made. Never use real secrets in issue reports or screenshots.
 
-**Do not deploy production accounts to SQLite on `/tmp`.** On Vercel, `/tmp/project-blue` may be used only as a temporary local database when running a non-production preview without a database URL. Production startup intentionally fails if the durable database URL is missing.
+API clients retain their normal Blue account/API-key authentication and add a **separate** `x-blue-provider-key` header to `POST /api/chat` or `POST /api/sessions/:id/messages`. Pass `provider` and `model` in the JSON body. For explicitly local requests use `provider: "local"`; no visitor key is required. Do not confuse a Blue `blue_sk_…` login/API credential with a model provider key.
 
-## 3. Add secrets and provider keys
+## Isolation and outbound policy
 
-Set these in Vercel → Project → Settings → Environment Variables:
+- AsyncLocalStorage gives each chat request its own credential context. Provider config reads only that context in public mode, never an owner key. The context is cleared when the response ends or disconnects; overlapping requests do not overwrite each other.
+- OpenAI, Anthropic and Gemini use fixed HTTPS provider endpoints. Custom OpenAI-compatible URLs and Ollama are unavailable in public mode. Gemini credentials are moved out of the query string to `x-goog-api-key` before network transmission.
+- Public mode installs a process-wide fetch policy for the existing agent/model/tool adapters. Only exact, credentialed POSTs to the three provider APIs are allowed; redirects are rejected. Network and non-success upstream errors are replaced with generic errors before reaching the existing agent's logs/SSE error handling. Streaming body errors are also sanitized.
+- The Neon driver is explicitly given the original fetch function for trusted SQL traffic. Database requests do not use visitor credentials or the agent/tool allowlist. Future integrations must be reviewed before bypassing or changing this policy.
+- **Web search, deep research, arbitrary page fetching, and local/private-network requests are disabled** on the public deployment. Their existing UI controls/tool definitions may still be visible; execution cannot make those requests. Search calls are blocked by `searchOffline`; page fetches are blocked by the outbound policy, including HTTP(S), loopback, metadata addresses, custom domains and redirect chains. Restoring page fetching requires a separately reviewed DNS/IP-pinning and redirect-safe SSRF design, not just a protocol check.
+- Existing login, account isolation, CSRF and per-account chat rate limits remain in place. Missing or malformed provider headers are rejected before chat handling. The current app may fall back to its limited local engine on provider failure; this never consumes an owner provider key.
 
-| Variable | Required? | Notes |
-| --- | --- | --- |
-| `BLUE_SESSION_SECRET` | Yes | Stable random value, at least 32 characters. Generate with `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"`. Keep it stable between deploys or browser sessions will be invalidated. |
-| `DATABASE_URL` or `POSTGRES_URL` | Yes in production | Neon/Postgres connection string. |
-| One of `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | Recommended | Without a remote model key Blue falls back to the deterministic offline planner; it is not a general-purpose language model. |
-| One of `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | Recommended for research | Without a search key Blue tries keyless DuckDuckGo, which is best-effort and may be blocked or rate-limited. |
-| `PUBLIC_URL` | Recommended | Canonical HTTPS origin, especially if using a custom domain. |
-| Provider model variables | Optional | `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`, `OLLAMA_MODEL`; defaults are in `server/config.js`. |
+## Costs and abuse
 
-Set the database and session secret separately for **Production**, **Preview**, and **Development** as appropriate. Prefer a separate Neon branch/database and secret for preview deployments. Never commit secrets or paste them into a public issue.
+Visitors pay their own provider's model charges, subject to their quota and selected model. This does **not** guarantee zero hosting cost: Vercel functions, bandwidth, storage, Neon database usage and abuse can still incur charges or exhaust free quotas. Review current plan terms and usage policies yourself; use budgets/alerts and platform abuse controls. No billing settings, spending limits or hosting resources are changed by this PR.
 
-## 4. Deploy and verify
+Registration is public and rate limits are not comprehensive bot protection. Before broad promotion, consider a registration gate/CAPTCHA, storage retention, account deletion, usage monitoring and platform-level rate controls. These are not implemented by this focused change. Use restricted provider keys with low limits and rotate suspected exposed keys.
 
-1. Deploy after setting environment variables. Production cold start validates `DATABASE_URL` and `BLUE_SESSION_SECRET` before serving a request.
-2. Open the deployment URL. Confirm the sign-in/register page and static CSS/JS load.
-3. Create a throwaway account, sign in again, and confirm a chat survives a redeploy. This checks both cookies and durable storage.
-4. Test one streamed turn (for example, `calc 21 * 2`), then test research with a configured search provider and an image/document with a model that supports that modality.
-5. Check Vercel's Function Logs and Neon metrics for cold-start, query, or provider errors. Avoid posting logs containing secrets or personal data.
+## Validation required before public release
 
-The function maximum duration is configured as 60 seconds. Check that this duration is available on your Vercel plan; if not, lower `maxDuration` in `vercel.json` and keep research/provider operations within that budget. The app uses Server-Sent Events for streamed chat; function streaming and timeout behavior should be confirmed on the actual Vercel plan/domain after deployment.
+Automated tests were **added but not executed** during remote editing. Run `npm ci && npm test` on Node.js 22.5+ and address failures before merging. The new `tests/byok.test.js` checks concurrent credential isolation, header validation and lifecycle cleanup, missing-key rejection, environment-key isolation, endpoint/SSRF denials, Gemini header transport, generic upstream errors and Neon's independent transport using fake credentials and mocked network calls.
 
-## Storage and capability limits
+Also test on a private Preview:
 
-- Local development: SQLite database in `data/`, protected by `.gitignore`.
-- Vercel production: Neon/Postgres. Do not use function-local files for persistence.
-- Files are sent inline and persisted with their chat. Up to three files can be attached; per-file and combined payload limits are enforced server-side. Images work with image-capable providers; Gemini handles image, PDF, audio and video input; Anthropic handles image and PDF; OpenAI-compatible providers and Ollama accept text and images in this app. Provider/model-specific limits can be stricter.
-- The offline engine can deterministically analyze CSV files and perform supported tools, but does not understand arbitrary images, audio, video or PDFs and is not equivalent to a frontier language model.
-- HTML code-fence previews run in a sandboxed opaque-origin iframe with scripts, links and external requests disabled by a restrictive Content Security Policy. They render static markup/styles; this is not an arbitrary code execution service.
-- Browser dictation and speech playback depend on browser support and user permissions.
+- Sign up/sign in, save remote provider/model settings, send a chat, reload history, clear the key and verify a remote chat is rejected without an upstream request.
+- Try two separate browser profiles with distinct disposable keys and concurrent chats. Check no cross-user settings, prompts or credentials appear.
+- Confirm SQL cold-start migrations, login and chat persistence work against Neon even with no visitor key. Confirm SSE streams and aborts properly on Vercel.
+- Test revoked/wrong keys and a mock redirect/error response. Confirm no raw upstream error body, key or credential-bearing URL appears in application logs, SSE, saved messages or database settings.
+- Confirm arbitrary page-fetch and search tool attempts make no outbound request, and custom base URLs/Ollama cannot be enabled from account settings.
+- Inspect headers/body capture at every proxy/monitoring layer and verify caches never retain API responses.
 
-## Troubleshooting
-
-- **Function fails on cold start:** verify Node 22 and production environment variables. A production Vercel instance must have `DATABASE_URL`/`POSTGRES_URL` and a 32+ character `BLUE_SESSION_SECRET`.
-- **Static file returns 404:** check that the project root is the repository root and `public/**` is included by the function config; redeploy after changing `vercel.json`.
-- **Login works but sessions do not survive deploys:** verify the app is using Neon/Postgres and that `BLUE_SESSION_SECRET` remains unchanged. SQLite on a function filesystem is temporary.
-- **SSE closes early:** check function duration/plan limits and logs. Slow providers or multi-query deep research can exceed a short function timeout.
-- **An attachment is rejected:** check the MIME type, file size and provider capabilities. A model API may impose limits lower than Project Blue's request limits.
-- **Web research fails:** configure a supported search API key, or use the offline/local tools that do not need external search.
+No live provider calls, Vercel deployment, billing changes, migration against a real database or end-to-end browser verification were performed during implementation. Passing unit tests alone is not a production security audit.
