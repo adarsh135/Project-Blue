@@ -99,7 +99,7 @@ export function installPublicTransport() {
     const key = visitorKey();
     if (!key) return fail();
     const gemini = url.origin === 'https://generativelanguage.googleapis.com' &&
-      /^\\/v1beta\\/models\\/[A-Za-z0-9._-]+:streamGenerateContent$/.test(url.pathname);
+      /^\/v1beta\/models\/[A-Za-z0-9._-]+:streamGenerateContent$/.test(url.pathname);
     const exact = endpoints.has(`${url.origin}${url.pathname}`);
     if ((!exact && !gemini) || method !== 'POST') return fail();
     const headers = new Headers(options.headers);
