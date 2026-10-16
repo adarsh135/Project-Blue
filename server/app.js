@@ -7,23 +7,16 @@ import { apiRouter } from './routes/api.routes.js';
 import { authRouter } from './routes/auth.routes.js';
 import { availableProviders, config, defaultProviderId, ROOT } from './config.js';
 import { log } from './lib/util.js';
+import { publicCredentialMiddleware } from './lib/byok.js';
 
 const CSP = [
-  "default-src 'self'",
-  "img-src 'self' data: blob:",
-  "media-src 'self' blob:",
-  "style-src 'self' 'unsafe-inline'",
-  "script-src 'self'",
-  "connect-src 'self'",
-  "form-action 'self'",
-  "base-uri 'none'",
-  "object-src 'none'",
+  "default-src 'self'", "img-src 'self' data: blob:", "media-src 'self' blob:",
+  "style-src 'self' 'unsafe-inline'", "script-src 'self'", "connect-src 'self'",
+  "form-action 'self'", "base-uri 'none'", "object-src 'none'",
 ].join('; ');
-
 export const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', config.env === 'production' ? 1 : true);
-
 app.use(express.json({ limit: config.maxRequestBytes, strict: true }));
 app.use((req, res, next) => {
   const requestId = String(req.headers['x-request-id'] || crypto.randomUUID()).slice(0, 100);
@@ -41,7 +34,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-
+if (config.publicByok) app.use(publicCredentialMiddleware);
 app.use((req, res, next) => {
   res.on('finish', () => {
     if (req.path.startsWith('/assets/') || req.path === '/favicon.ico') return;
@@ -49,69 +42,41 @@ app.use((req, res, next) => {
   });
   next();
 });
-
-// ---- browser auth API -------------------------------------------------
-// Resolve sessions only for API routes; static assets must not incur database
-// reads on every JS/CSS request on the Vercel function.
 app.use('/api/auth', attachUser, requireSameOrigin, authRouter);
-
 app.get('/api/status', (req, res) => {
-  res.json({
-    ok: true,
-    version: config.version,
-    providers: availableProviders(),
-    default_provider: defaultProviderId(),
-    database: config.databaseKind,
+  res.json({ ok: true, version: config.version, public_byok: config.publicByok,
+    providers: availableProviders(), default_provider: defaultProviderId(), database: config.databaseKind,
     search_configured: Object.entries(config.search).filter(([, value]) => value).map(([key]) => key),
   });
 });
-
-// ---- product API (auth required inside the router) --------------------
 app.use('/api', attachUser, apiRouter);
-
-// ---- static single-page-ish app --------------------------------------
 const publicDir = path.join(ROOT, 'public');
-app.use(
-  express.static(publicDir, {
-    extensions: ['html'],
-    setHeaders(res, filePath) {
-      if (/\.(css|js|woff2?)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=300');
-      else res.setHeader('Cache-Control', 'no-cache');
-    },
-  }),
-);
-
-app.get('/', (req, res) => {
-  res.sendFile(path.join(publicDir, 'index.html'));
-});
-
+app.use(express.static(publicDir, {
+  extensions: ['html'],
+  setHeaders(res, filePath) {
+    if (/\.(css|js|woff2?)$/.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=300');
+    else res.setHeader('Cache-Control', 'no-cache');
+  },
+}));
+app.get('/', (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api/')) return res.status(404).json({ error: `No such endpoint: ${req.path}` });
+  if (req.path.startsWith('/api/')) return res.status(404).json({ error: config.publicByok ? 'No such endpoint' : `No such endpoint: ${req.path}` });
   if (req.method === 'GET' && fs.existsSync(path.join(publicDir, 'index.html'))) {
-    return res.status(404).sendFile(path.join(publicDir, '404.html'), (error) => {
-      if (error) res.sendStatus(404);
-    });
+    return res.status(404).sendFile(path.join(publicDir, '404.html'), error => { if (error) res.sendStatus(404); });
   }
   return next();
 });
-
-// Express 5 forwards rejected promises here. Avoid leaking provider, SQL,
-// stack-trace or credential details from production responses.
 app.use((error, req, res, next) => {
   const status = Number(error?.status || error?.statusCode) || 500;
-  log('error', `${req.requestId || 'unknown'} ${error?.stack || error?.message || String(error)}`);
+  // Public-mode diagnostics must never interpolate headers, bodies or upstream errors.
+  log('error', config.publicByok ? `request failed (${status})` : `${req.requestId || 'unknown'} ${error?.stack || error?.message || String(error)}`);
   if (res.headersSent) return res.end();
-  if (error?.type === 'entity.too.large' || status === 413) {
-    return res.status(413).json({ error: 'Request is too large. Reduce the message or attachment size.' });
-  }
-  if (error instanceof SyntaxError && status === 400) {
-    return res.status(400).json({ error: 'Request body must be valid JSON.' });
-  }
+  if (error?.type === 'entity.too.large' || status === 413) return res.status(413).json({ error: 'Request is too large. Reduce the message or attachment size.' });
+  if (error instanceof SyntaxError && status === 400) return res.status(400).json({ error: 'Request body must be valid JSON.' });
   return res.status(status >= 400 && status < 500 ? status : 500).json({
-    error: status >= 500 ? 'Something went wrong on the server.' : error?.message || 'Request failed.',
+    error: config.publicByok || status >= 500 ? 'Something went wrong on the server.' : error?.message || 'Request failed.',
     request_id: req.requestId,
-    detail: config.env === 'development' ? error?.message : undefined,
+    detail: !config.publicByok && config.env === 'development' ? error?.message : undefined,
   });
 });
-
 export default app;
