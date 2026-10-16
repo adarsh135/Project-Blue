@@ -40,9 +40,9 @@ const PRICEY = /\b(price|prices|cost|stock|net worth|release date|weather|score|
 // Restrict bare-host recognition to common public TLDs so dotted identifiers
 // and private-looking email addresses do not accidentally become fetch targets.
 const TLD = 'com|org|net|io|dev|ai|co|edu|gov|info|biz|app|xyz|me|us|uk|in|de|fr|jp|au|ca|sh|so|to|gg|tv|news|blog|site|online|store|tech|cloud|works|wiki';
-const SCHEME_URL = /\\bhttps?:\\/\\/[^\\s<>"'\`\\)\\]]+/i;
-const BARE_URL = new RegExp(`\\\\b(?:www\\\\.)?[a-z0-9][a-z0-9-]*(?:\\\\.[a-z0-9-]+)*\\\\.(?:${TLD})(?:\\\\/[^\\\\s<>"'\`\\)\\]]*)?`, 'i');
-const FETCH_VERBS = /\\b(fetch|open|read|load|visit|pull up|grab|scrape|summari[sz]e|summarise|digest|extract|review|check out|look at|what does)\\b/i;
+const SCHEME_URL = /\bhttps?:\/\/[^\s<>"')\]]+/i;
+const BARE_URL = new RegExp('\\b(?:www\\.)?[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9-]+)*\\.(?:' + TLD + ')(?:\\/[^\\s<>"\')\\]]*)?', 'i');
+const FETCH_VERBS = /\b(fetch|open|read|load|visit|pull up|grab|scrape|summari[sz]e|summarise|digest|extract|review|check out|look at|what does)\b/i;
 
 /** Pull the first URL out of a message, with or without an https:// scheme. */
 export function extractUrl(text) {
