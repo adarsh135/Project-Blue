@@ -1,0 +1,4 @@
+interface:
+  display_name: "BLUE Code"
+  short_description: "Implement and review code with evidence"
+  default_prompt: "Use $blue-code to review the supplied code and propose a tested improvement."

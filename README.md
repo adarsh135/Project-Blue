@@ -29,10 +29,31 @@ Most "AI chat" repos are a thin wrapper around one vendor's SDK. Project Blue is
 
 ---
 
+## Agents, skills and app connections
+
+Open **Agents & skills** to create, edit or delete your specialists and instruction skills.
+BLUE includes Researcher, Coder and Reviewer presets. Choose up to three agents in selection
+order and run a foreground task. Each step has its own saved conversation and passes its
+answer to the next agent. Stop cancels the current request and prevents later steps. Closing
+the tab does not create a durable background job. A remote model and your own key are
+required for specialist reasoning; the local engine remains a deterministic tool assistant.
+
+Skills are instruction packs, not executable plugins or permission grants. Agent tools are
+intersected with your account's enabled tools. Built-ins can be copied but not overwritten.
+The three versioned skills live under `skills/`; custom skills and agents are scoped to your
+account in SQL. Source, tests and deployment configuration live on `blue/agent-workspace`.
+
+Connect public GitHub repositories in the same screen. Test a connection before use and
+enable `github_repository` in Tools for existing accounts. Agents can read repository
+metadata, README and ten open issues. No token is required; GitHub rate limits apply.
+Private repositories, OAuth, arbitrary MCP servers, app writes, autonomous deployment,
+code execution and scheduled/background agents are **not implemented**. BLUE does not
+inherit ChatGPT's connected apps or subscription, and does not claim GPT-6 Astra parity.
+
 ## Quick start
 
 ```bash
-git clone https://github.com/adarsh135/Project-Blue.git
+git clone --branch blue/agent-workspace https://github.com/adarsh135/Project-Blue.git
 cd Project-Blue
 npm install
 npm start

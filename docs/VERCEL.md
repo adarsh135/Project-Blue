@@ -53,3 +53,22 @@ Also test on a private Preview:
 - Inspect headers/body capture at every proxy/monitoring layer and verify caches never retain API responses.
 
 The repository integration has triggered a Vercel deployment, but no live provider calls, migration against a real Neon database, billing changes or browser end-to-end validation have been performed here. Passing unit tests alone is not a production security audit.
+
+## Agent workspace release
+
+Deploy the exact reviewed commit from `blue/agent-workspace`. `main` still contains only
+a README; deploying main will not deploy this app. The serverless bundle includes
+`public/` and `skills/`. `workspace_items` is created alongside the existing schema,
+after `users`, on SQLite and Postgres.
+
+This version adds credential-free GET requests to three fixed GitHub paths for connected
+public repositories: `/repos/{owner}/{repo}`, `/readme` and `/issues?state=open&per_page=10`.
+Headers are rebuilt without credentials, redirects are rejected and responses are bounded.
+No OAuth credential store or generic URL/MCP proxy is introduced.
+
+Hosting setup requires a project-specific Neon database connection in `DATABASE_URL`,
+a stable `BLUE_SESSION_SECRET` and `BLUE_PUBLIC_BYOK=true`. A successful Vercel build
+does not prove the database is configured: verify `/api/status`, registration, chat,
+workspace save/reload and account isolation against the deployed app before publishing.
+Keep deployment protection until that verification succeeds. Free-tier availability and
+usage quotas do not guarantee unlimited free service; no paid plan is required by this code.

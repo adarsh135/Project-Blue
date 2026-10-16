@@ -237,3 +237,22 @@ test('theme toggle flips the document theme and persists it', () => {
   document.querySelector('#theme-toggle').click();
   assert.equal(document.documentElement.dataset.theme, 'dark');
 });
+
+test('workspace navigation saves skills and agent profiles through the real UI and API', async()=>{
+ document.querySelector('[data-view=workspace]').click();
+ await waitFor(()=>document.querySelector('#workspace-agents').textContent.includes('Researcher'));
+ assert.equal(document.querySelector('#view-workspace').style.display,'block');
+ document.querySelector('#skill-name').value='UI skill';
+ document.querySelector('#skill-instructions').value='Answer with evidence.';
+ document.querySelector('#skill-form').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+ await waitFor(()=>document.querySelector('#workspace-skills').textContent.includes('UI skill'));
+ document.querySelector('#agent-name').value='UI analyst';
+ document.querySelector('#agent-instructions').value='Analyze the request.';
+ const skill=[...document.querySelectorAll('#agent-skills label')].find(x=>x.textContent==='UI skill').querySelector('input');skill.checked=true;
+ document.querySelector('#agent-tools input[value=calculator]').checked=true;
+ document.querySelector('#agent-form').dispatchEvent(new window.Event('submit',{bubbles:true,cancelable:true}));
+ await waitFor(()=>document.querySelector('#workspace-agents').textContent.includes('UI analyst'));
+ const {loadWorkspace}=await import('../public/js/workspace.js');await loadWorkspace();
+ assert.match(document.querySelector('#workspace-agents').textContent,/UI analyst/);
+ assert.match(document.querySelector('#team-selection').textContent,/UI analyst/);
+});

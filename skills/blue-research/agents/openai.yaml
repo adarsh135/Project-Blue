@@ -1,0 +1,4 @@
+interface:
+  display_name: "BLUE Research"
+  short_description: "Research questions with cited evidence"
+  default_prompt: "Use $blue-research to research a question and cite the evidence."

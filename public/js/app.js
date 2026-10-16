@@ -1,3 +1,4 @@
+import { loadWorkspace, wireWorkspace, resetWorkspace } from './workspace.js';
 import { api } from './api.js';
 import { state, subscribe, currentSession } from './store.js';
 import * as chat from './chat.js';
@@ -12,6 +13,7 @@ async function boot() {
   applyTheme(localStorage.getItem('blue-theme') || 'dark');
   wireAuthForms();
   wireShell();
+  wireWorkspace();
 
   try {
     const meta = await api('/api/auth/providers');
@@ -20,7 +22,7 @@ async function boot() {
     const remote = meta.providers.filter((p) => p.kind === 'remote');
     if (pill) {
       pill.innerHTML = remote.length
-        ? `<span class="dot"></span> ${remote.length} provider${remote.length > 1 ? 's' : ''} ready · ${escapeHtml(remote[0].label)}`
+        ? `<span class="dot"></span> ${remote.length} provider${remote.length > 1 ? 's' : ''} ${remote.some(p=>p.requires_visitor_key) ? 'available · your key required' : 'ready'} · ${escapeHtml(remote[0].label)}`
         : '<span class="dot"></span> Blue Local Engine (no API key needed)';
     }
     $('#ttl-days').textContent = Math.round((meta.limits?.sessionTtlHours || 168) / 24);
@@ -399,12 +401,13 @@ function setView(view) {
   const chatView = $('#view-chat');
   const isChat = view === 'chat';
   chatView.style.display = isChat ? 'flex' : 'none';
-  for (const id of ['searches', 'memories', 'tools', 'settings', 'account']) {
+  for (const id of ['searches', 'memories', 'tools', 'settings', 'account', 'workspace']) {
     $(`#view-${id}`).style.display = view === id ? 'block' : 'none';
   }
   $('#rail').style.display = isChat && state.railOpen ? 'flex' : 'none';
   $('#sidebar').classList.remove('open');
 
+  if (view === 'workspace') loadWorkspace().catch(error=>toast(error.message,'err'));
   if (view === 'account') refreshAccountView();
   if (view === 'searches') panels.loadSearches().catch(() => {});
 }
@@ -481,6 +484,7 @@ function updateTopbarSub() {
 }
 
 async function signOut() {
+  resetWorkspace();
   try {
     await api('/api/auth/logout', { method: 'POST' });
   } catch {

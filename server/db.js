@@ -16,6 +16,14 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS workspace_items (
+ id TEXT PRIMARY KEY,
+ user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL,
+ content TEXT NOT NULL,
+ updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS credentials (
   id           TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -224,6 +232,7 @@ export const DEFAULT_SETTINGS = {
   temperature: 0.7,
   system_prompt: null,
   tools_enabled: [
+    'github_repository',
     'web_search',
     'deep_research',
     'fetch_page',

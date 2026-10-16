@@ -558,3 +558,5 @@ a:hover { text-decoration: underline; }
 @media (max-width: 640px) {
   .visitor-key-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); }
 }
+
+.workspace-item{padding:18px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.workspace-item .btn{margin:4px 8px 4px 0}.workspace-choice{display:inline-flex;gap:8px;align-items:center;margin:10px 18px 10px 0;font-size:13px}#view-workspace form{margin-top:20px}#view-workspace label{display:block;margin-top:12px}#view-workspace label.workspace-choice{display:inline-flex}#view-workspace fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:12px}#view-workspace form>.btn{margin-top:14px}#team-task{margin:12px 0}#view-workspace h2{font-size:28px;margin:12px 0}
