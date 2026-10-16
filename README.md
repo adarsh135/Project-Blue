@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-44%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-65%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -62,6 +62,7 @@ Blue picks the provider automatically; per-account you can switch provider, mode
 | `what time is it in Asia/Kolkata?` | `clock` tool, real IANA timezone maths |
 | `calc (1250 * 1.18) / 3` | `calculator` tool — exact, no hallucinated arithmetic |
 | `search the web for the latest Node.js LTS release` | `web_search` → cited markdown links, logged in Recent searches |
+| `read https://api.github.com/repos/nodejs/node` | `fetch_page` — the readable text of that URL, pretty-printed for APIs |
 | `show my recent searches` | `search_history` tool renders your own search log |
 | `find in my chats about sqlite` | `session_search` across every message you've ever sent |
 | `who are you?` | Blue explains its own credential/session/memory architecture |
@@ -167,6 +168,67 @@ curl -X POST localhost:4000/api/chat \
 
 ---
 
+## Web search
+
+`web_search` tries the configured provider first (Tavily → Brave → Serper). With no key it
+falls back to DuckDuckGo's keyless endpoints: the Instant Answer API for entity/definition
+facts, then the `html.duckduckgo.com` and `lite.duckduckgo.com` SERP lanes over **POST** with
+a `Referer` (DuckDuckGo tolerates this far longer than a GET) and a minimum spacing between
+requests.
+
+Be aware of what keyless means in practice: DuckDuckGo rate-limits per IP and, once a machine
+is flagged, answers with an **anti-bot challenge page served as HTTP 202**. `fetch` treats 202
+as success, so a naive scraper reads that as "0 results" and tells you your query matched
+nothing. Blue detects the challenge (status, `anomaly.js`, the modal markup) and says so:
+
+```
+⚠️ web_search failed
+DuckDuckGo served an anti-bot challenge instead of results (HTTP 202).
+This is an IP-reputation block on the machine running Blue, not a problem with your query.
+```
+
+`GET /api/status` reports the active backend and the last outcome, so you can tell a block
+from an empty result set without reading logs:
+
+```json
+"search": { "provider": "duckduckgo", "keyless": true,
+            "last": { "results": 0, "blocked": true, "error": null } }
+```
+
+If you see `blocked: true` more than occasionally, set `TAVILY_API_KEY`, `BRAVE_API_KEY` or
+`SERPER_API_KEY`. The failed attempt is still recorded in Recent searches with
+`provider: 'unavailable'`, so your history stays honest about what happened.
+
+---
+
+## Model lifecycle
+
+Vendors retire model IDs on their own schedule, and a stale `.env` otherwise shows up as a
+mystery 404 in the middle of a conversation. Blue ships current defaults, recognises retired
+IDs, and turns the vendor's error into one that names the replacement:
+
+| Provider | Default | Retired IDs it will catch |
+| --- | --- | --- |
+| OpenAI-compatible | `gpt-5.6-terra` | `gpt-4o-mini`, `gpt-4o` (flagged as deprecated) |
+| Anthropic | `claude-sonnet-5` | the whole Claude 3/3.5/3.7 line, Opus 4.1 |
+| Google Gemini | `gemini-3.8-flash` | every Gemini 1.x and 2.0 model |
+| Ollama | `llama3.1` | — (local tags, no vendor lifecycle) |
+
+```
+gemini request failed (HTTP 404). model "gemini-1.5-flash" was retired by the provider on
+2025-09-29. Update your .env to gemini-3.8-flash.
+```
+
+`GET /api/status` also lists anything stale under `stale_models`. A test asserts that no
+shipped default is a model a vendor has already retired, and that every replacement named in
+the registry is itself still current.
+
+Two provider-specific notes: Gemini authenticates with the documented `x-goog-api-key` header
+rather than the legacy `?key=` query parameter, and sampling parameters (`temperature`,
+`top_p`, `top_k`) are omitted for Gemini 3.x and later, where Google deprecated them.
+
+---
+
 ## Security notes
 
 * **Passwords** — scrypt (`N=32768, r=8, p=1`, 64-byte key, per-user random salt). Login failures are indistinguishable between "unknown email" and "wrong password".
@@ -194,14 +256,15 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | `BLUE_SEARCH_OFFLINE` | `false` | never make outbound search requests |
 | `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
 | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
-| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | search providers (keyless DuckDuckGo otherwise) |
+| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | search providers (keyless DuckDuckGo otherwise — see *Web search* below) |
+| `BLUE_SEARCH_MIN_INTERVAL_MS` | `3000` | spacing between keyless DuckDuckGo requests |
 
 ---
 
 ## Tests
 
 ```bash
-npm test        # 44 tests, ~8s, no network required
+npm test        # 65 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -210,6 +273,7 @@ npm test        # 44 tests, ~8s, no network required
 * `tests/api.test.js` — boots the real server on a random port: registration validation, identical login failures, CSRF blocking, API-key auth, per-user isolation, search recording/pinning, session revocation, password change
 * `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
 * `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
+* `tests/compatibility.test.js` — no default model is one a vendor has retired, retired-ID errors name their replacement, and a DuckDuckGo anti-bot challenge is reported as a block rather than as "no results"
 
 ---
 
@@ -239,7 +303,7 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                44 tests
+tests/                65 tests
 docs/ARCHITECTURE.md  data model, flows, SSE protocol
 ```
 

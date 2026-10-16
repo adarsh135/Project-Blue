@@ -13,6 +13,29 @@ import { evaluateExpression, prettyNumber } from './math.js';
 
 const FETCH_TIMEOUT_MS = 12_000;
 
+/**
+ * Node's fetch reports almost every transport problem as the single word
+ * "fetch failed" and hides the useful part on `error.cause`. Unwrap it so a
+ * TLS/DNS/proxy problem is diagnosable instead of mysterious.
+ */
+function describeFetchFailure(error, url) {
+  if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+    return new Error(`Timed out fetching ${url} (the host may be unreachable from this server).`);
+  }
+  const cause = error?.cause;
+  const code = cause?.code || cause?.errno;
+  const detail = cause?.message || error?.message || 'unknown error';
+  const hint =
+    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'CERT_HAS_EXPIRED'
+      ? ' The server rejects the TLS certificate chain — on a network with a TLS-inspecting proxy, point NODE_EXTRA_CA_CERTS at the proxy CA bundle.'
+      : code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+        ? ' DNS lookup failed — check the hostname and this machine\'s resolver.'
+        : code === 'ECONNREFUSED'
+          ? ' The host refused the connection.'
+          : '';
+  return new Error(`Could not reach ${url} (${code || 'no code'}: ${detail}).${hint}`);
+}
+
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || FETCH_TIMEOUT_MS);
@@ -26,9 +49,28 @@ async function fetchWithTimeout(url, options = {}) {
         ...(options.headers || {}),
       },
     });
+  } catch (error) {
+    throw describeFetchFailure(error, String(url));
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Pretty-print a JSON body so an API endpoint reads like a document, and cut it
+ * at a line boundary rather than mid-token.
+ */
+function renderJson(body, maxChars) {
+  let pretty = String(body);
+  try {
+    pretty = JSON.stringify(JSON.parse(pretty), null, 2);
+  } catch {
+    /* not valid JSON — show it as it arrived */
+  }
+  if (pretty.length <= maxChars) return pretty;
+  const clipped = pretty.slice(0, maxChars);
+  const lastBreak = Math.max(clipped.lastIndexOf('\n'), clipped.lastIndexOf(', '));
+  return `${lastBreak > maxChars * 0.5 ? clipped.slice(0, lastBreak) : clipped}\n… (truncated)`;
 }
 
 function stripHtml(html) {
@@ -123,10 +165,109 @@ async function searchSerper(query, max) {
   };
 }
 
+/**
+ * Thrown when a keyless search lane answered, but with an anti-bot challenge
+ * instead of results. Keeping this distinct from "no results" is the whole
+ * point: DuckDuckGo serves the challenge as HTTP 202, which `fetch` reports as
+ * `res.ok === true`, so a naive parser sees "0 results" and the user is told
+ * their query matched nothing when in fact the request was blocked.
+ */
+export class SearchBlockedError extends Error {
+  constructor(provider, detail) {
+    super(
+      `${provider} served an anti-bot challenge instead of results${detail ? ` (${detail})` : ''}. ` +
+        'This is an IP-reputation block on the machine running Blue, not a problem with your query. ' +
+        'Add TAVILY_API_KEY, BRAVE_API_KEY or SERPER_API_KEY to .env for dependable web search.',
+    );
+    this.name = 'SearchBlockedError';
+    this.blocked = true;
+  }
+}
+
+const DDG_BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+/** Markers present on DuckDuckGo's anomaly/challenge page, absent from real SERPs. */
+function looksLikeDdgChallenge(body) {
+  return (
+    /anomaly-modal|anomaly\.js|data-testid="anomaly/i.test(body) ||
+    /Unfortunately, bots use DuckDuckGo too/i.test(body)
+  );
+}
+
+function decodeDdgHref(href) {
+  const raw = String(href || '');
+  const wrapped = /[?&]uddg=([^&]+)/.exec(raw);
+  const target = wrapped ? decodeURIComponent(wrapped[1]) : raw;
+  return target.startsWith('//') ? `https:${target}` : target;
+}
+
+function parseDdgHtml(html, results, max) {
+  const blocks = html.split(/<div class="result__body"/).slice(1);
+  for (const block of blocks) {
+    const link = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
+    const snip = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/.exec(block);
+    if (!link) continue;
+    const url = decodeDdgHref(link[1]);
+    if (!/^https?:/i.test(url) || results.some((r) => r.url === url)) continue;
+    results.push({
+      title: stripHtml(link[2]).slice(0, 160),
+      url,
+      snippet: snip ? truncate(stripHtml(snip[1]), 400) : '',
+    });
+    if (results.length >= max) break;
+  }
+  return results;
+}
+
+/**
+ * DuckDuckGo throttles per IP: GET dies quickly, POST plus a Referer survives
+ * noticeably longer, so POST is the lane we use. We also space requests out —
+ * hammering the endpoint is what trips the anomaly flag in the first place.
+ */
+const DDG_MIN_INTERVAL_MS = Math.max(0, Number(process.env.BLUE_SEARCH_MIN_INTERVAL_MS ?? 3000) || 0);
+let ddgNextAllowedAt = 0;
+let ddgLastOutcome = null;
+
+async function ddgThrottle() {
+  const wait = ddgNextAllowedAt - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  ddgNextAllowedAt = Date.now() + DDG_MIN_INTERVAL_MS;
+}
+
+/** One keyless HTML lane. Returns parsed results, or throws SearchBlockedError. */
+async function ddgHtmlLane(host, path, query, inbox, max) {
+  await ddgThrottle();
+  const res = await fetchWithTimeout(`https://${host}${path}`, {
+    method: 'POST',
+    timeoutMs: 9000,
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'user-agent': DDG_BROWSER_UA,
+      accept: 'text/html,application/xhtml+xml',
+      referer: `https://${host}/`,
+    },
+    body: new URLSearchParams({ q: query, kl: 'wt-wt' }).toString(),
+  });
+
+  const body = await res.text().catch(() => '');
+  // 202 is the documented anomaly status; 403/429 are the blunter forms.
+  if (res.status === 202 || res.status === 403 || res.status === 429 || looksLikeDdgChallenge(body)) {
+    throw new SearchBlockedError('DuckDuckGo', `HTTP ${res.status}`);
+  }
+  if (!res.ok) throw new Error(`DuckDuckGo ${host} returned HTTP ${res.status}`);
+  parseDdgHtml(body, inbox, max);
+  return inbox;
+}
+
 async function searchDuckDuckGo(query, max) {
-  // Keyless best effort: Instant Answer API first, then the HTML endpoint.
+  // Keyless best effort, two lanes: Instant Answer API (entity/definition
+  // facts, never throttled) then the HTML SERP lanes (organic results).
   const results = [];
   let answer = '';
+  let sawChallenge = null;
+  let lastLaneError = null;
+
   try {
     const ia = new URL('https://api.duckduckgo.com/');
     ia.searchParams.set('q', query);
@@ -150,45 +291,52 @@ async function searchDuckDuckGo(query, max) {
       }
     }
   } catch {
-    /* ignore, fall through to HTML endpoint */
+    /* ignore, fall through to the HTML lanes */
   }
 
   if (results.length < max) {
-    try {
-      const htmlUrl = new URL('https://html.duckduckgo.com/html/');
-      htmlUrl.searchParams.set('q', query);
-      const res = await fetchWithTimeout(htmlUrl, { timeoutMs: 9000 });
-      if (res.ok) {
-        const html = await res.text();
-        const blocks = html.split(/<div class="result__body"/).slice(1);
-        for (const block of blocks) {
-          const link = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
-          const snip = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/.exec(block);
-          if (!link) continue;
-          let href = link[1];
-          const wrapped = /uddg=([^&]+)/.exec(href);
-          if (wrapped) href = decodeURIComponent(wrapped[1]);
-          const url = href.startsWith('//') ? `https:${href}` : href;
-          if (results.some((r) => r.url === url)) continue;
-          results.push({
-            title: stripHtml(link[2]).slice(0, 160),
-            url,
-            snippet: snip ? truncate(stripHtml(snip[1]), 400) : '',
-          });
-          if (results.length >= max) break;
-        }
+    for (const [host, path] of [
+      ['html.duckduckgo.com', '/html/'],
+      ['lite.duckduckgo.com', '/lite/'],
+    ]) {
+      try {
+        await ddgHtmlLane(host, path, query, results, max);
+      } catch (error) {
+        if (error instanceof SearchBlockedError) sawChallenge = sawChallenge || error;
+        else lastLaneError = error;
       }
-    } catch {
-      /* ignore */
+      if (results.length >= max) break;
     }
   }
 
+  ddgLastOutcome = {
+    at: new Date().toISOString(),
+    query,
+    results: results.length,
+    blocked: !results.length && Boolean(sawChallenge),
+    error: !results.length && lastLaneError ? lastLaneError.message : null,
+  };
+
+  // Partial results still count as success — only fail when we truly got nothing.
   if (!results.length) {
+    if (sawChallenge) throw sawChallenge;
+    // A transport failure (DNS, TLS, firewall) is more informative than "no
+    // provider answered", so prefer it when we have one.
+    if (lastLaneError) throw lastLaneError;
     throw new Error(
       'No keyless search provider responded. Add TAVILY_API_KEY, BRAVE_API_KEY or SERPER_API_KEY to .env for reliable web search.',
     );
   }
   return { answer, results: results.slice(0, max) };
+}
+
+/** Health snapshot for /api/status — "is the keyless lane currently blocked?". */
+export function searchHealth() {
+  return {
+    provider: searchProvider(),
+    keyless: searchProvider() === 'duckduckgo',
+    last: ddgLastOutcome,
+  };
 }
 
 export async function runWebSearch(query, maxResults = 5) {
@@ -337,7 +485,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
         const body = await res.text();
         const maxChars = Math.min(Math.max(Number(args.max_chars) || 6000, 500), 40_000);
         const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(body)?.[1];
-        const text = contentType.includes('json') ? body.slice(0, maxChars) : stripHtml(body).slice(0, maxChars);
+        const text = contentType.includes('json') ? renderJson(body, maxChars) : stripHtml(body).slice(0, maxChars);
         return { ok: true, url, title: title ? stripHtml(title) : undefined, text, summary: `Fetched ${url}` };
       }
 
@@ -425,6 +573,9 @@ export async function executeTool(name, args = {}, ctx = {}) {
       ok: false,
       error: error?.message || String(error),
       summary: `${name} failed: ${error?.message || error}`,
+      // Preserve the "challenged by an anti-bot page" signal so the UI can
+      // explain a block instead of implying the query simply matched nothing.
+      blocked: error?.blocked || undefined,
       elapsed_ms: Date.now() - started,
     };
   }
