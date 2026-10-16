@@ -170,7 +170,7 @@ async function* geminiStream({ apiKey, baseUrl, model, system, contents, tools, 
   const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
   const generationConfig = { maxOutputTokens: 4096 };
   // Gemini 3+ models no longer accept legacy sampling parameters.
-  const major = /^gemini-(\\d+)/i.exec(String(model || ''));
+  const major = /^gemini-(\d+)/i.exec(String(model || ''));
   if (!major || Number(major[1]) < 3) generationConfig.temperature = temperature;
   const body = {
     contents,
