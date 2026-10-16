@@ -20,6 +20,7 @@ export function initializeVisitorKeyUI() {
     if (!status.public_byok) return;
     if (document.readyState === 'loading') await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
     const panel = document.createElement('aside');
+    panel.className = 'visitor-key-panel';
     panel.setAttribute('aria-label', 'Visitor AI credentials');
     const label = document.createElement('label');
     label.textContent = 'Your AI provider key (this tab only): ';
