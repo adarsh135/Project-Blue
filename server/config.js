@@ -51,7 +51,7 @@ export const config = {
   sessionSecret: sessionSecret(),
   sessionTtlHours: Number(process.env.SESSION_TTL_HOURS || 168),
   forceLocalEngine: bool(process.env.BLUE_FORCE_LOCAL_ENGINE),
-  searchOffline: publicByok || bool(process.env.BLUE_SEARCH_OFFLINE),
+  searchOffline: bool(process.env.BLUE_SEARCH_OFFLINE),
   maxToolRounds: Number(process.env.BLUE_MAX_TOOL_ROUNDS || 4),
   maxHistoryMessages: Math.min(Math.max(Number(process.env.BLUE_MAX_HISTORY_MESSAGES || 160), 20), 500),
   maxContextChars: Math.min(Math.max(Number(process.env.BLUE_MAX_CONTEXT_CHARS || 240000), 20000), 1000000),
