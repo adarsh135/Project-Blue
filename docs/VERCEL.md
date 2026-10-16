@@ -28,9 +28,9 @@ API clients retain their normal Blue account/API-key authentication and add a **
 
 - AsyncLocalStorage gives each chat request its own credential context. Provider config reads only that context in public mode, never an owner key. The context is cleared when the response ends or disconnects; overlapping requests do not overwrite each other.
 - OpenAI, Anthropic and Gemini use fixed HTTPS provider endpoints. Custom OpenAI-compatible URLs and Ollama are unavailable in public mode. Gemini credentials are moved out of the query string to `x-goog-api-key` before network transmission.
-- Public mode installs a process-wide fetch policy for the existing agent/model/tool adapters. Only exact, credentialed POSTs to the three provider APIs are allowed; redirects are rejected. Network and non-success upstream errors are replaced with generic errors before reaching the existing agent's logs/SSE error handling. Streaming body errors are also sanitized.
+- Public mode installs a process-wide fetch policy for the existing agent/model/tool adapters. Model calls are limited to exact, credentialed POSTs to the three fixed provider APIs. Search uses a separate, credential-free allowlist for the DuckDuckGo Instant Answer endpoint and two fixed HTML result endpoints, with bounded query parameters, POST bodies, timeouts and redirects rejected. Other destinations are rejected. Model/upstream errors are replaced with generic errors before reaching the agent logs/SSE; streaming body errors are also sanitized.
 - The Neon driver is explicitly given the original fetch function for trusted SQL traffic. Database requests do not use visitor credentials or the agent/tool allowlist. Future integrations must be reviewed before bypassing or changing this policy.
-- **Web search, deep research, arbitrary page fetching, and local/private-network requests are disabled** on the public deployment. Their existing UI controls/tool definitions may still be visible; execution cannot make those requests. Search calls are blocked by `searchOffline`; page fetches are blocked by the outbound policy, including HTTP(S), loopback, metadata addresses, custom domains and redirect chains. Restoring page fetching requires a separately reviewed DNS/IP-pinning and redirect-safe SSRF design, not just a protocol check.
+- **Web search and multi-query deep research** use the fixed DuckDuckGo endpoints above, with request throttling and challenge detection. This is keyless and may be rate-limited by the provider; public mode intentionally ignores owner commercial-search keys. **Arbitrary page fetching, custom outbound destinations, loopback/private/metadata addresses and redirect chains remain blocked.** The `fetch_page` control may still appear in the UI but will fail closed in public mode. Restoring arbitrary page reading requires a separately reviewed DNS/IP-pinning and redirect-safe SSRF design—not just a protocol check.
 - Existing login, account isolation, CSRF and per-account chat rate limits remain in place. Missing or malformed provider headers are rejected before chat handling. The current app may fall back to its limited local engine on provider failure; this never consumes an owner provider key.
 
 ## Costs and abuse
@@ -41,7 +41,7 @@ Registration is public and rate limits are not comprehensive bot protection. Bef
 
 ## Validation required before public release
 
-Automated tests were **added but not executed** during remote editing. Run `npm ci && npm test` on Node.js 22.5+ and address failures before merging. The new `tests/byok.test.js` checks concurrent credential isolation, header validation and lifecycle cleanup, missing-key rejection, environment-key isolation, endpoint/SSRF denials, Gemini header transport, generic upstream errors and Neon's independent transport using fake credentials and mocked network calls.
+Run `npm ci && npm test` on Node.js 22.5+ and require the BLUE CI workflow to pass before merging. The automated suite uses fake credentials and mocked network calls to test concurrent credential isolation, header validation and lifecycle cleanup, missing-key rejection, owner-key isolation, strict provider/search egress allowlists, Gemini header transport, generic upstream errors, and Neon’s independent transport.
 
 Also test on a private Preview:
 
@@ -49,7 +49,7 @@ Also test on a private Preview:
 - Try two separate browser profiles with distinct disposable keys and concurrent chats. Check no cross-user settings, prompts or credentials appear.
 - Confirm SQL cold-start migrations, login and chat persistence work against Neon even with no visitor key. Confirm SSE streams and aborts properly on Vercel.
 - Test revoked/wrong keys and a mock redirect/error response. Confirm no raw upstream error body, key or credential-bearing URL appears in application logs, SSE, saved messages or database settings.
-- Confirm arbitrary page-fetch and search tool attempts make no outbound request, and custom base URLs/Ollama cannot be enabled from account settings.
+- Confirm arbitrary page-fetch attempts make no outbound request; fixed DuckDuckGo requests work under the allowlist, reject injected parameters and cannot follow redirects; and custom base URLs/Ollama cannot be enabled from account settings.
 - Inspect headers/body capture at every proxy/monitoring layer and verify caches never retain API responses.
 
-No live provider calls, Vercel deployment, billing changes, migration against a real database or end-to-end browser verification were performed during implementation. Passing unit tests alone is not a production security audit.
+The repository integration has triggered a Vercel deployment, but no live provider calls, migration against a real Neon database, billing changes or browser end-to-end validation have been performed here. Passing unit tests alone is not a production security audit.
