@@ -500,3 +500,61 @@ a:hover { text-decoration: underline; }
   .code-actions { opacity: 1; }
   .artifact-preview iframe { min-height: 260px; }
 }
+
+
+/* Public BYOK key panel: compact, readable and separate from the chat composer. */
+.visitor-key-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 92px;
+  z-index: 1000;
+  width: min(360px, calc(100vw - 24px));
+  padding: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  color: var(--text);
+  background: var(--panel-solid);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.visitor-key-panel label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.visitor-key-panel input {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  outline: none;
+  background: var(--panel-2);
+  color: var(--text);
+}
+.visitor-key-panel input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.visitor-key-panel button {
+  align-self: end;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.visitor-key-panel button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.visitor-key-panel p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+@media (max-width: 640px) {
+  .visitor-key-panel { right: 12px; bottom: 84px; width: calc(100vw - 24px); }
+}
