@@ -123,72 +123,148 @@ async function searchSerper(query, max) {
   };
 }
 
+/**
+ * Distinguish an empty search page from an anti-bot challenge. DuckDuckGo can
+ * serve a challenge as HTTP 202, which otherwise looks like a successful but
+ * empty result set.
+ */
+export class SearchBlockedError extends Error {
+  constructor(provider, detail) {
+    const advice = config.publicByok
+      ? 'The hosted keyless search lane is temporarily rate-limited; try again later.'
+      : 'Add TAVILY_API_KEY, BRAVE_API_KEY or SERPER_API_KEY to .env for dependable web search.';
+    super(provider + ' served an anti-bot challenge instead of results' + (detail ? ' (' + detail + ')' : '') + '. ' + advice);
+    this.name = 'SearchBlockedError';
+    this.blocked = true;
+  }
+}
+
+const DDG_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const DDG_MIN_INTERVAL_MS = Math.min(30_000, Math.max(0, Number(process.env.BLUE_SEARCH_MIN_INTERVAL_MS ?? 3000) || 0));
+let ddgNextAllowedAt = 0;
+let ddgQueue = Promise.resolve();
+
+function looksLikeDdgChallenge(body) {
+  return /anomaly-modal|anomaly\.js|data-testid="anomaly/i.test(body) ||
+    /Unfortunately, bots use DuckDuckGo too/i.test(body);
+}
+
+function decodeDdgHref(href) {
+  const raw = String(href || '');
+  const wrapped = /[?&]uddg=([^&]+)/.exec(raw);
+  let target = raw;
+  try { if (wrapped) target = decodeURIComponent(wrapped[1]); } catch { target = raw; }
+  return target.startsWith('//') ? 'https:' + target : target;
+}
+
+function parseDdgHtml(html, results, max) {
+  const blocks = html.split(/<div class="result__body"/).slice(1);
+  for (const block of blocks) {
+    const link = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
+    const snip = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/.exec(block);
+    if (!link) continue;
+    const url = decodeDdgHref(link[1]);
+    if (!/^https?:/i.test(url) || results.some((r) => r.url === url)) continue;
+    results.push({
+      title: stripHtml(link[2]).slice(0, 160),
+      url,
+      snippet: snip ? truncate(stripHtml(snip[1]), 400) : '',
+    });
+    if (results.length >= max) break;
+  }
+  return results;
+}
+
+async function throttleDdg() {
+  let release;
+  const previous = ddgQueue;
+  ddgQueue = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const wait = Math.max(0, ddgNextAllowedAt - Date.now());
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    ddgNextAllowedAt = Date.now() + DDG_MIN_INTERVAL_MS;
+  } finally {
+    release();
+  }
+}
+
+async function ddgHtmlLane(host, pathname, query, results, max) {
+  await throttleDdg();
+  const base = 'https://' + host;
+  const res = await fetchWithTimeout(base + pathname, {
+    method: 'POST',
+    timeoutMs: 9000,
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'user-agent': DDG_BROWSER_UA,
+      accept: 'text/html,application/xhtml+xml',
+      referer: base + '/',
+    },
+    body: new URLSearchParams({ q: query, kl: 'wt-wt' }).toString(),
+  });
+  const body = await res.text().catch(() => '');
+  if (res.status === 202 || res.status === 403 || res.status === 429 || looksLikeDdgChallenge(body)) {
+    throw new SearchBlockedError('DuckDuckGo', 'HTTP ' + res.status);
+  }
+  if (!res.ok) throw new Error('DuckDuckGo ' + host + ' returned HTTP ' + res.status);
+  parseDdgHtml(body, results, max);
+  return results;
+}
+
 async function searchDuckDuckGo(query, max) {
-  // Keyless best effort: Instant Answer API first, then the HTML endpoint.
   const results = [];
   let answer = '';
+  let sawChallenge = null;
+  let lastLaneError = null;
+
+  // Instant Answer is useful for definitions and known entities; the HTML lanes
+  // supply the organic links needed for current news and deeper research.
   try {
     const ia = new URL('https://api.duckduckgo.com/');
-    ia.searchParams.set('q', query);
+    ia.searchParams.set('q', query.slice(0, 500));
     ia.searchParams.set('format', 'json');
     ia.searchParams.set('no_html', '1');
     const res = await fetchWithTimeout(ia, { timeoutMs: 8000 });
     if (res.ok) {
       const data = await res.json();
       answer = data.AbstractText || data.Answer || '';
-      if (data.AbstractURL) {
-        results.push({
-          title: data.Heading || query,
-          url: data.AbstractURL,
-          snippet: truncate(data.AbstractText || '', 400),
-        });
-      }
+      if (data.AbstractURL) results.push({
+        title: data.Heading || query,
+        url: data.AbstractURL,
+        snippet: truncate(data.AbstractText || '', 400),
+      });
       for (const topic of (data.RelatedTopics || []).slice(0, max)) {
         if (topic.FirstURL && topic.Text) {
           results.push({ title: truncate(topic.Text, 90), url: topic.FirstURL, snippet: truncate(topic.Text, 400) });
         }
       }
+    } else if (res.status === 202 || res.status === 403 || res.status === 429) {
+      sawChallenge = new SearchBlockedError('DuckDuckGo Instant Answer', 'HTTP ' + res.status);
     }
-  } catch {
-    /* ignore, fall through to HTML endpoint */
+  } catch (error) {
+    lastLaneError = error;
   }
 
   if (results.length < max) {
-    try {
-      const htmlUrl = new URL('https://html.duckduckgo.com/html/');
-      htmlUrl.searchParams.set('q', query);
-      const res = await fetchWithTimeout(htmlUrl, { timeoutMs: 9000 });
-      if (res.ok) {
-        const html = await res.text();
-        const blocks = html.split(/<div class="result__body"/).slice(1);
-        for (const block of blocks) {
-          const link = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/.exec(block);
-          const snip = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/.exec(block);
-          if (!link) continue;
-          let href = link[1];
-          const wrapped = /uddg=([^&]+)/.exec(href);
-          if (wrapped) href = decodeURIComponent(wrapped[1]);
-          const url = href.startsWith('//') ? `https:${href}` : href;
-          if (results.some((r) => r.url === url)) continue;
-          results.push({
-            title: stripHtml(link[2]).slice(0, 160),
-            url,
-            snippet: snip ? truncate(stripHtml(snip[1]), 400) : '',
-          });
-          if (results.length >= max) break;
-        }
+    for (const [host, pathname] of [
+      ['html.duckduckgo.com', '/html/'],
+      ['lite.duckduckgo.com', '/lite/'],
+    ]) {
+      try {
+        await ddgHtmlLane(host, pathname, query.slice(0, 500), results, max);
+      } catch (error) {
+        if (error instanceof SearchBlockedError) sawChallenge = sawChallenge || error;
+        else lastLaneError = error;
       }
-    } catch {
-      /* ignore */
+      if (results.length >= max) break;
     }
   }
 
-  if (!results.length) {
-    throw new Error(
-      'No keyless search provider responded. Add TAVILY_API_KEY, BRAVE_API_KEY or SERPER_API_KEY to .env for reliable web search.',
-    );
-  }
-  return { answer, results: results.slice(0, max) };
+  if (results.length) return { answer, results: results.slice(0, max) };
+  if (sawChallenge) throw sawChallenge;
+  if (lastLaneError) throw lastLaneError;
+  throw new Error('DuckDuckGo returned no results. Try a more specific query or configure a search provider in a trusted self-hosted installation.');
 }
 
 export async function runWebSearch(query, maxResults = 5) {
