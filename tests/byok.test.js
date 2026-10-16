@@ -61,6 +61,9 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
     assert.equal(config.providers.openai.baseUrl, 'https://api.openai.com/v1');
     assert.equal(config.search.tavily, '');
     assert.equal(config.searchOffline, true);
+    assert.equal(config.providers.openai.defaultModel, 'gpt-6.1-sol');
+    assert.equal(config.providers.anthropic.defaultModel, 'claude-sonnet-5');
+    assert.equal(config.providers.gemini.defaultModel, 'gemini-3.8-flash');
     assert.equal(config.providers.ollama.baseUrl, '');
     assert.ok(availableProviders().some(p => p.id === 'openai' && p.requires_visitor_key));
     await assert.rejects(fetch('https://api.openai.com/v1/chat/completions', { method: 'POST' }));
@@ -72,7 +75,9 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
       assert.equal(calls.length, 0);
       await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer visitor-fake' } });
       assert.equal(calls[0].options.redirect, 'error');
-      await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse&key=visitor-fake', { method: 'POST' });
+      await assert.rejects(fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse&key=visitor-fake', { method: 'POST', headers: { 'x-goog-api-key': 'visitor-fake' } }));
+      assert.equal(calls.length, 1, 'a Gemini key in the URL is rejected before network transmission');
+      await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse', { method: 'POST', headers: { 'x-goog-api-key': 'visitor-fake' } });
       assert.ok(!calls[1].url.includes('visitor-fake'));
       assert.equal(calls[1].options.headers.get('x-goog-api-key'), 'visitor-fake');
       fail = true;
