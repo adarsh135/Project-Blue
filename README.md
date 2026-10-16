@@ -1,8 +1,8 @@
-# ◈ Project Blue
+# ◈ BLUE AI
 
-**A self-hosted, agentic AI assistant — with secure accounts, multimodal chat, deep research, durable memory and per-user search history.**
+**BLUE is a personal agentic AI assistant with secure accounts, streaming chat, multimodal files, persistent memory, practical tools and model choice.**
 
-Blue is an inspectable Node.js assistant you can run locally or deploy to Vercel. It works offline with SQLite and its deterministic local engine, and uses Neon Postgres plus your chosen model/search providers for a durable, hosted deployment.
+BLUE AI is an inspectable Node.js assistant you can run locally or host on Vercel. It works offline with SQLite and its deterministic local engine, and uses Neon Postgres plus compatible model providers for durable hosted accounts.
 
 ![status](https://img.shields.io/badge/tests-automated-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
@@ -65,8 +65,8 @@ The repository includes a Vercel Node.js Function entry point (`api/index.js`) a
 1. Import this repository into Vercel and use **Node.js 22** (the version required by `package.json`). No frontend build command or output directory is needed.
 2. Provision a Neon Postgres database (for example, through the Vercel Marketplace) and add its pooled connection string as `DATABASE_URL` or `POSTGRES_URL`.
 3. Add `BLUE_SESSION_SECRET` with at least 32 characters. Generate one with `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"` and keep the same value across deployments/environments where sessions should remain valid.
-4. Add at least one model provider key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`) and, for reliable current research, a search key (`TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY`). Blue can run without a model key, but its offline planner is intentionally limited.
-5. Redeploy, then visit the Vercel domain and create an account. Configure all credentials in Vercel's Environment Variables; never commit them to the repo.
+4. For the public release branch, set `BLUE_PUBLIC_BYOK=true` in both Production and Preview. Visitors add their own OpenAI, Anthropic or Gemini key in the UI; never place an owner model/search key in a public deployment.
+5. Redeploy, create an account, and test in an isolated Preview. Public mode disables web search, deep research, arbitrary URL fetching and Ollama/custom base URLs for SSRF protection. Those full network tools are available in a trusted self-hosted setup with `BLUE_PUBLIC_BYOK=false` and only after you understand the trust boundary.
 
 `vercel.json` sets a 60-second function duration and includes the `public/` assets used by Express. Confirm that duration is available on your Vercel plan. The database URL and session secret are required by the app at production cold start; a missing or invalid value fails early rather than silently losing user data. See [docs/VERCEL.md](docs/VERCEL.md) for storage, environment, streaming and troubleshooting notes.
 
@@ -126,7 +126,7 @@ The repository includes a Vercel Node.js Function entry point (`api/index.js`) a
 5. Results are fed back and the model streams again — up to `BLUE_MAX_TOOL_ROUNDS` (default 4) rounds, so no runaway loops.
 6. The final answer is persisted with provider, model, latency and token counts. If a remote provider is unreachable, Blue emits a visible notice and re-answers with the offline engine rather than showing an error.
 
-See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the data model, the auth flow and the SSE protocol.
+See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the data model, auth flow and SSE protocol. Public-deployment requirements and the security model are documented in **[docs/VERCEL.md](docs/VERCEL.md)**.
 
 ---
 
