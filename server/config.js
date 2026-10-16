@@ -58,9 +58,9 @@ export const config = {
   maxRequestBytes: 4 * 1024 * 1024,
   maxAttachmentBytes: 2 * 1024 * 1024,
   providers: {
-    openai: remoteProvider('openai', publicByok ? 'OpenAI (your key)' : 'OpenAI-compatible', publicByok ? 'https://api.openai.com/v1' : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''), process.env.OPENAI_MODEL || 'gpt-4o-mini', publicByok ? '' : process.env.OPENAI_API_KEY || ''),
-    anthropic: remoteProvider('anthropic', 'Anthropic', 'https://api.anthropic.com/v1', process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest', publicByok ? '' : process.env.ANTHROPIC_API_KEY || ''),
-    gemini: remoteProvider('gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta', process.env.GEMINI_MODEL || 'gemini-1.5-flash', publicByok ? '' : process.env.GEMINI_API_KEY || ''),
+    openai: remoteProvider('openai', publicByok ? 'OpenAI (your key)' : 'OpenAI-compatible', publicByok ? 'https://api.openai.com/v1' : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''), process.env.OPENAI_MODEL || 'gpt-6.1-sol', publicByok ? '' : process.env.OPENAI_API_KEY || ''),
+    anthropic: remoteProvider('anthropic', 'Anthropic', 'https://api.anthropic.com/v1', process.env.ANTHROPIC_MODEL || 'claude-sonnet-5', publicByok ? '' : process.env.ANTHROPIC_API_KEY || ''),
+    gemini: remoteProvider('gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta', process.env.GEMINI_MODEL || 'gemini-3.8-flash', publicByok ? '' : process.env.GEMINI_API_KEY || ''),
     ollama: { id: 'ollama', label: 'Ollama (local)', apiKey: '', baseUrl: publicByok ? '' : (process.env.OLLAMA_BASE_URL || '').replace(/\/$/, ''), defaultModel: process.env.OLLAMA_MODEL || 'llama3.1' },
   },
   search: {
@@ -68,7 +68,7 @@ export const config = {
     brave: publicByok ? '' : process.env.BRAVE_API_KEY || '',
     serper: publicByok ? '' : process.env.SERPER_API_KEY || '',
   },
-  version: '1.2.0',
+  version: '1.3.0',
 };
 if (publicByok) installPublicTransport();
 export function availableProviders() {
