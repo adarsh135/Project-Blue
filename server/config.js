@@ -100,6 +100,12 @@ export const config = {
     brave: process.env.BRAVE_API_KEY || '',
     serper: process.env.SERPER_API_KEY || '',
   },
+  // A self-hosted SearXNG instance is a dependable, keyless search backend and
+  // the durable answer to DuckDuckGo's per-IP throttling. Accepts either name.
+  searxngUrl: (process.env.BLUE_SEARXNG_URL || process.env.SEARXNG_URL || '').replace(/\/$/, ''),
+  // Point the keyless DuckDuckGo HTML lanes at a mirror, proxy or local test
+  // server instead of duckduckgo.com. Empty (the default) means the real host.
+  searchDdgBase: (process.env.BLUE_SEARCH_DDG_BASE || '').replace(/\/$/, ''),
 };
 
 /** Providers that are actually usable right now. */
@@ -219,6 +225,7 @@ export const PUBLIC_LIMITS = {
     tavily: !!config.search.tavily,
     brave: !!config.search.brave,
     serper: !!config.search.serper,
+    searxng: !!config.searxngUrl,
     duckduckgo: true,
   },
 };

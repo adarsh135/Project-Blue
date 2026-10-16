@@ -101,8 +101,61 @@ function searchProvider() {
   if (config.search.tavily) return 'tavily';
   if (config.search.brave) return 'brave';
   if (config.search.serper) return 'serper';
+  if (config.searxngUrl) return 'searxng';
   return 'duckduckgo';
 }
+
+/**
+ * Self-hosted SearXNG. Keyless, aggregates whatever engines the instance is
+ * configured with, and is not the target of a per-IP anti-bot campaign the way
+ * duckduckgo.com is — so it is the dependable path for anyone who cannot or
+ * will not hold a commercial search API key.
+ *
+ * Requires `json` in the instance's `search.formats`; when that is missing the
+ * instance answers this endpoint with its HTML UI, which we detect and explain.
+ */
+async function searchSearxng(query, max) {
+  const url = new URL(`${config.searxngUrl}/search`);
+  url.searchParams.set('q', query);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('safesearch', '1');
+
+  const res = await fetchWithTimeout(url, { timeoutMs: 12_000, headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    throw new Error(
+      `SearXNG ${res.status} ${res.statusText}`.trim() +
+        (res.status === 403 ? ` — ${config.searxngUrl} may need "json" added to search.formats.` : ''),
+    );
+  }
+
+  const contentType = res.headers.get('content-type') || '';
+  const raw = await res.text();
+  if (!contentType.includes('json')) {
+    throw new Error(
+      `SearXNG at ${config.searxngUrl} answered with ${contentType || 'an unknown content type'} instead of JSON. ` +
+        'Add "json" to its search.formats setting, or point BLUE_SEARXNG_URL at an instance that has it enabled.',
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`SearXNG at ${config.searxngUrl} returned a body that is not valid JSON.`);
+  }
+
+  return {
+    answer: (data.answers || [])
+      .map((a) => (typeof a === 'string' ? a : a?.answer))
+      .filter(Boolean)
+      .join(' '),
+    results: (data.results || [])
+      .filter((r) => r?.url)
+      .slice(0, max)
+      .map((r) => ({ title: r.title || r.url, url: r.url, snippet: truncate(stripHtml(r.content || ''), 400) })),
+  };
+}
+
 
 async function searchTavily(query, max) {
   const res = await fetchWithTimeout('https://api.tavily.com/search', {
@@ -237,15 +290,18 @@ async function ddgThrottle() {
 
 /** One keyless HTML lane. Returns parsed results, or throws SearchBlockedError. */
 async function ddgHtmlLane(host, path, query, inbox, max) {
+  // A configured base replaces duckduckgo.com entirely — for a mirror, a proxy,
+  // or a local server in tests so the real transport path gets exercised.
+  const base = config.searchDdgBase || `https://${host}`;
   await ddgThrottle();
-  const res = await fetchWithTimeout(`https://${host}${path}`, {
+  const res = await fetchWithTimeout(`${base}${path}`, {
     method: 'POST',
     timeoutMs: 9000,
     headers: {
       'content-type': 'application/x-www-form-urlencoded',
       'user-agent': DDG_BROWSER_UA,
       accept: 'text/html,application/xhtml+xml',
-      referer: `https://${host}/`,
+      referer: `${base}/`,
     },
     body: new URLSearchParams({ q: query, kl: 'wt-wt' }).toString(),
   });
@@ -269,6 +325,7 @@ async function searchDuckDuckGo(query, max) {
   let lastLaneError = null;
 
   try {
+    if (config.searchDdgBase) throw new Error('keyless base overridden — skipping the public Instant Answer API');
     const ia = new URL('https://api.duckduckgo.com/');
     ia.searchParams.set('q', query);
     ia.searchParams.set('format', 'json');
@@ -332,9 +389,11 @@ async function searchDuckDuckGo(query, max) {
 
 /** Health snapshot for /api/status — "is the keyless lane currently blocked?". */
 export function searchHealth() {
+  const provider = searchProvider();
   return {
-    provider: searchProvider(),
-    keyless: searchProvider() === 'duckduckgo',
+    provider,
+    keyless: provider === 'duckduckgo' || provider === 'searxng',
+    instance: provider === 'searxng' ? config.searxngUrl : undefined,
     last: ddgLastOutcome,
   };
 }
@@ -347,7 +406,13 @@ export async function runWebSearch(query, maxResults = 5) {
   const max = Math.min(Math.max(Number(maxResults) || 5, 1), 10);
   const q = String(query || '').trim();
   if (!q) throw new Error('Query is required');
-  const handler = { tavily: searchTavily, brave: searchBrave, serper: searchSerper, duckduckgo: searchDuckDuckGo }[provider];
+  const handler = {
+    tavily: searchTavily,
+    brave: searchBrave,
+    serper: searchSerper,
+    searxng: searchSearxng,
+    duckduckgo: searchDuckDuckGo,
+  }[provider];
   const { answer, results } = await handler(q, max);
   return { provider, query: q, answer, results };
 }

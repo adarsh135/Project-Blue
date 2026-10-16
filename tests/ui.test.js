@@ -174,7 +174,14 @@ test('the conversation appears in the sidebar and reopens with its history', asy
 test('memory and search panels render from the API', async () => {
   const { api } = await import('../public/js/api.js');
   await api('/api/memories', { method: 'POST', body: { key: 'editor', value: 'neovim' } });
-  await api('/api/searches', { method: 'POST', body: { query: 'ui smoke search' } }).catch(() => {});
+  // This suite runs offline, so the search backend always fails — what the test
+  // really pins is that a *failed* search is still recorded and rendered.
+  // Assert that explicitly rather than swallowing the error, which is what used
+  // to hide the 502 this endpoint returns.
+  await api('/api/searches', { method: 'POST', body: { query: 'ui smoke search' } }).then(
+    () => assert.fail('expected the search backend to fail while offline'),
+    (error) => assert.match(String(error?.message || error), /disabled|unavailable|502/i),
+  );
 
   const panels = await import('../public/js/panels.js');
   await panels.loadMemories();

@@ -152,8 +152,9 @@ configure instead.
 
 | tool | notes |
 | --- | --- |
-| `web_search` | Tavily → Brave → Serper → keyless DuckDuckGo (Instant Answer + POST SERP lanes). A 202/anomaly anti-bot page is raised as `SearchBlockedError`, never as an empty result set; every attempt is recorded in `searches`, including failures (`provider: 'unavailable'`) |
+| `web_search` | Tavily → Brave → Serper → SearXNG (`BLUE_SEARXNG_URL`, keyless and dependable) → keyless DuckDuckGo (Instant Answer + POST SERP lanes). A 202/anomaly anti-bot page is raised as `SearchBlockedError`, never as an empty result set; every attempt is recorded in `searches`, including failures (`provider: 'unavailable'`) |
 | `fetch_page` | 12s timeout, HTML→readable text and JSON→pretty-printed, capped at 40k chars; transport failures unwrap the `error.cause` (DNS/TLS/refused) instead of reporting "fetch failed" |
+| `search_lanes` | `BLUE_SEARCH_DDG_BASE` re-points the keyless lanes at a mirror, proxy or local server; `searchHealth()` reports the active backend, whether it is keyless, and the last outcome |
 | `calculator` | recursive-descent parser: `+ - * / % ^`, functions, constants; no `eval`; thousands separators supported |
 | `clock` | `Intl.DateTimeFormat` with a validated IANA timezone |
 | `memory` | `save` / `recall` / `forget` against the `memories` table |

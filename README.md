@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-65%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-79%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -170,11 +170,30 @@ curl -X POST localhost:4000/api/chat \
 
 ## Web search
 
-`web_search` tries the configured provider first (Tavily → Brave → Serper). With no key it
-falls back to DuckDuckGo's keyless endpoints: the Instant Answer API for entity/definition
-facts, then the `html.duckduckgo.com` and `lite.duckduckgo.com` SERP lanes over **POST** with
-a `Referer` (DuckDuckGo tolerates this far longer than a GET) and a minimum spacing between
-requests.
+`web_search` picks the first configured backend:
+
+```
+Tavily → Brave → Serper → SearXNG → keyless DuckDuckGo
+```
+
+The first three need a key. **SearXNG is the keyless option that actually holds up** — point
+`BLUE_SEARXNG_URL` at your own instance and search no longer depends on somebody else's
+throttling policy. It aggregates whatever engines you configure on it, and there is no per-IP
+anti-bot campaign aimed at a private instance:
+
+```bash
+docker run -d -p 8080:8080 searxng/searxng
+# then, in .env:
+BLUE_SEARXNG_URL=http://localhost:8080
+```
+
+The instance needs `json` in its `search.formats` setting. If it is missing, Blue detects the
+HTML response and says exactly that rather than failing vaguely.
+
+Only with none of the above does `web_search` fall back to DuckDuckGo's keyless endpoints: the
+Instant Answer API for entity/definition facts, then the `html.duckduckgo.com` and
+`lite.duckduckgo.com` SERP lanes over **POST** with a `Referer` (DuckDuckGo tolerates this far
+longer than a GET) and a minimum spacing between requests.
 
 Be aware of what keyless means in practice: DuckDuckGo rate-limits per IP and, once a machine
 is flagged, answers with an **anti-bot challenge page served as HTTP 202**. `fetch` treats 202
@@ -195,7 +214,8 @@ from an empty result set without reading logs:
             "last": { "results": 0, "blocked": true, "error": null } }
 ```
 
-If you see `blocked: true` more than occasionally, set `TAVILY_API_KEY`, `BRAVE_API_KEY` or
+If you see `blocked: true` more than occasionally, move off the scrape lane: set
+`BLUE_SEARXNG_URL` at your own instance, or one of `TAVILY_API_KEY`, `BRAVE_API_KEY`,
 `SERPER_API_KEY`. The failed attempt is still recorded in Recent searches with
 `provider: 'unavailable'`, so your history stays honest about what happened.
 
@@ -256,15 +276,17 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | `BLUE_SEARCH_OFFLINE` | `false` | never make outbound search requests |
 | `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
 | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
-| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | search providers (keyless DuckDuckGo otherwise — see *Web search* below) |
+| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | commercial search providers (see *Web search* below) |
+| `BLUE_SEARXNG_URL` | – | self-hosted SearXNG — keyless and dependable |
 | `BLUE_SEARCH_MIN_INTERVAL_MS` | `3000` | spacing between keyless DuckDuckGo requests |
+| `BLUE_SEARCH_DDG_BASE` | – | send keyless lanes to a mirror/proxy instead of duckduckgo.com |
 
 ---
 
 ## Tests
 
 ```bash
-npm test        # 65 tests, ~8s, no network required
+npm test        # 79 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -274,6 +296,7 @@ npm test        # 65 tests, ~8s, no network required
 * `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
 * `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
 * `tests/compatibility.test.js` — no default model is one a vendor has retired, retired-ID errors name their replacement, and a DuckDuckGo anti-bot challenge is reported as a block rather than as "no results"
+* `tests/search-live.test.js` — the search lanes against a **real HTTP server on a real socket**: a real 202 is detected, the POST body and `Referer` really arrive, lane fallback works, and a SearXNG instance is consumed as JSON and explained when it is not
 
 ---
 
@@ -303,7 +326,7 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                65 tests
+tests/                79 tests
 docs/ARCHITECTURE.md  data model, flows, SSE protocol
 ```
 
