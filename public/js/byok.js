@@ -37,7 +37,7 @@ export function initializeVisitorKeyUI() {
     clear.textContent = 'Clear key';
     clear.addEventListener('click', clearVisitorKey);
     const help = document.createElement('p');
-    help.textContent = 'Choose the matching provider and model in Settings. Your key is sent over HTTPS through this server to that provider, never saved by Blue. The provider may charge you. Reload or clear to forget it. Research/page fetching are disabled on this public deployment. Never paste a key into chat.';
+    help.textContent = 'Choose the matching provider and model in Settings. Your key is sent over HTTPS through this server to that provider, never saved by Blue. The provider may charge you. Reload or clear to forget it. Web search and multi-query research use a limited public DuckDuckGo endpoint; arbitrary page fetching is blocked on this deployment. Never paste a key into chat.';
     panel.append(label, clear, help);
     document.body.prepend(panel);
   })().catch(() => { initialized = undefined; });
