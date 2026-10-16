@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-78%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-81%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -285,7 +285,8 @@ stream over SSE and will otherwise arrive in one lump at the end.
 ## Security notes
 
 * **Passwords** — scrypt (`N=32768, r=8, p=1`, 64-byte key, per-user random salt). Login failures are indistinguishable between "unknown email" and "wrong password".
-* **Sessions** — random 256-bit token, only its SHA-256 stored. HttpOnly + SameSite=Lax cookie with a separate readable CSRF cookie; state-changing requests must present the matching `x-blue-csrf` header or a same-origin `Origin`/`Referer`.
+* **Sessions** — random 256-bit token, only its SHA-256 stored. HttpOnly cookie with a separate readable CSRF cookie; state-changing requests must present the matching `x-blue-csrf` header or a same-origin `Origin`/`Referer`.
+* **Cookie scope** — `SameSite=Lax; Secure` in production, which is the stronger setting and correct because the app is served same-origin. Off production it relaxes to `SameSite=None; Secure; Partitioned` over HTTPS, because a hosted preview embeds the app cross-site in an iframe and a `Lax` cookie is **not sent** on those requests — the effect being a login that returns 200 and then an app that shows nothing. Override with `BLUE_COOKIE_SAMESITE` (`lax` / `strict` / `none`).
 * **API keys** — `blue_sk_<prefix>_<secret>`; only the SHA-256 of the secret is stored, the plaintext is shown exactly once, comparison is timing-safe, and keys can be revoked per key.
 * **Rate limiting** — login/register limits per IP, per-user message throughput cap.
 * **Isolation** — every query is scoped by `user_id`; a foreign chat id returns 404, never data.
@@ -311,6 +312,8 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
 | `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | commercial search providers (see *Web search* below) |
 | `BLUE_SEARXNG_URL` | `http://searxng:8080` in Compose | self-hosted SearXNG — keyless and dependable; empty drops the lane |
+| `BLUE_COOKIE_SAMESITE` | *auto* | `Lax` normally, `None` off production over HTTPS so the app works embedded cross-site (see *Cookies* below) |
+| `BLUE_COOKIE_PARTITIONED` | `true` | add CHIPS `Partitioned` alongside `SameSite=None` |
 | `BLUE_SEARCH_MIN_INTERVAL_MS` | `3000` | spacing between keyless DuckDuckGo requests |
 | `BLUE_SEARCH_DDG_BASE` | – | send keyless lanes to a mirror/proxy instead of duckduckgo.com |
 
@@ -319,7 +322,7 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 ## Tests
 
 ```bash
-npm test        # 78 tests, ~8s, no network required
+npm test        # 81 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -359,7 +362,7 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                78 tests
+tests/                81 tests
 Dockerfile            production image (Node 22, non-root, healthcheck)
 docker-compose.yml    Blue + SearXNG + Caddy; database on a named volume
 searxng/settings.yml  instance config — enables the JSON API Blue calls

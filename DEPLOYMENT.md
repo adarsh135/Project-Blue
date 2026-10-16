@@ -252,6 +252,7 @@ curl -sI -X POST https://problue.run.place/api/auth/register \
 | `DOMAIN` | The name Caddy gets a certificate for. Must match the DNS record. |
 | `ACME_EMAIL` | Let's Encrypt expiry notices. Optional but recommended. |
 | `BLUE_SEARXNG_URL` | Defaults to the bundled instance. See *About search* below. |
+| `BLUE_COOKIE_SAMESITE` | Leave unset. Production decides `Lax` automatically; set `none` only if you embed the app cross-site (see troubleshooting). |
 | `OPENAI_API_KEY` etc. | Picks a real model. Without one, Blue answers from its offline engine. |
 
 ### About search
@@ -372,6 +373,16 @@ SSE. Ensure `flush_interval -1` on the reverse proxy (both configs above set it)
 
 **Logged out after every deploy** — `BLUE_SESSION_SECRET` is changing, or the
 data volume is not mounted at `/data`.
+
+**Login succeeds, then the app shows nothing** — the cookie is being stored but
+not sent back. This happens when the app is embedded cross-site (an `<iframe>`
+on another origin): a `SameSite=Lax` cookie is not attached to those requests,
+so `POST /api/auth/login` answers 200 and the four calls that follow —
+`/api/sessions`, `/api/tools`, `/api/memories`, `/api/searches` — all answer
+**401**, which looks like a successful login followed by a blank app. The fix is
+`SameSite=None; Secure`, which the app already applies automatically off
+production and which you can force with `BLUE_COOKIE_SAMESITE=none`. On a normal
+same-origin deployment you should *not* need it — leave it unset.
 
 ---
 

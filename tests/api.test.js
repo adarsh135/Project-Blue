@@ -451,3 +451,63 @@ test('cookies are not Secure over plain HTTP, so local development still works',
     assert.ok(!/;\s*Secure/i.test(cookie), `unexpected Secure on http: ${cookie}`);
   }
 });
+
+/**
+ * The regression that made the hosted preview look broken.
+ *
+ * The preview embeds the app cross-site, in an iframe on another origin. With
+ * `SameSite=Lax` the browser stores the cookie but refuses to *send* it on
+ * those requests, so login returned 200 and the four calls that follow it
+ * (sessions, tools, memories, searches) all returned 401. The visible symptom
+ * was an app that logs you in and then shows nothing at all.
+ *
+ * `SameSite=None; Secure` is what makes a cookie usable in that context, and
+ * `Partitioned` (CHIPS) keeps it working in browsers that block third-party
+ * cookies outright. Browsers that do not know `Partitioned` ignore it.
+ */
+test('cookies permit cross-site embedding off production, so the preview iframe stays signed in', async () => {
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
+    body: JSON.stringify({ email: `embed-${Date.now()}@example.com`, password: 'Sup3rSecret1' }),
+  });
+  assert.equal(res.status, 201);
+
+  const cookies = res.headers.getSetCookie();
+  assert.equal(cookies.length, 2, 'session and CSRF cookies');
+  for (const cookie of cookies) {
+    assert.match(cookie, /SameSite=None/i, `embedded contexts need SameSite=None: ${cookie}`);
+    assert.match(cookie, /;\s*Secure/i, `SameSite=None is rejected without Secure: ${cookie}`);
+    assert.match(cookie, /Partitioned/i, `expected the CHIPS attribute: ${cookie}`);
+  }
+});
+
+test('SameSite falls back to Lax over plain HTTP instead of a cookie the browser would throw away', async () => {
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: `lax-${Date.now()}@example.com`, password: 'Sup3rSecret1' }),
+  });
+  assert.equal(res.status, 201);
+  for (const cookie of res.headers.getSetCookie()) {
+    assert.match(cookie, /SameSite=Lax/i, `plain HTTP must stay Lax: ${cookie}`);
+    assert.ok(!/SameSite=None/i.test(cookie), `never send None without Secure: ${cookie}`);
+  }
+});
+
+test('production stays on the stronger SameSite=Lax, so the fix does not weaken the real deployment', async () => {
+  const { cookiePolicy } = await import('../server/auth.js');
+  const { config } = await import('../server/config.js');
+  const saved = { env: config.env, sameSite: config.cookieSameSite };
+  config.env = 'production';
+  config.cookieSameSite = '';
+  try {
+    const policy = cookiePolicy({ headers: { 'x-forwarded-proto': 'https' }, secure: false });
+    assert.equal(policy.sameSite, 'Lax', 'a same-origin deployment behind Caddy must not be relaxed');
+    assert.equal(policy.secure, true);
+    assert.equal(policy.partitioned, false);
+  } finally {
+    config.env = saved.env;
+    config.cookieSameSite = saved.sameSite;
+  }
+});

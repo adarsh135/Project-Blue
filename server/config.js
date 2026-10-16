@@ -56,6 +56,14 @@ export const config = {
   dbFile: process.env.BLUE_DB_FILE || path.join(DATA_DIR, 'blue.db'),
   sessionSecret: sessionSecret(),
   sessionTtlHours: Number(process.env.SESSION_TTL_HOURS || 168),
+  // SameSite for the session + CSRF cookies. Empty means "decide per request"
+  // (see cookiePolicy in auth.js): `lax` in production, `none` over HTTPS
+  // elsewhere, because dev/preview runs are commonly embedded cross-site.
+  cookieSameSite: (process.env.BLUE_COOKIE_SAMESITE || '').trim().toLowerCase(),
+  // Adds `Partitioned` to the cross-site cookies. On by default: it is what
+  // keeps them working in browsers that block third-party cookies outright,
+  // and browsers that do not know the attribute ignore it.
+  cookiePartitioned: bool(process.env.BLUE_COOKIE_PARTITIONED, true),
   forceLocalEngine: bool(process.env.BLUE_FORCE_LOCAL_ENGINE),
   // Skip every outbound search request (used by tests and air-gapped installs).
   searchOffline: bool(process.env.BLUE_SEARCH_OFFLINE),

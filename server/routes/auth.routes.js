@@ -2,6 +2,7 @@ import express from 'express';
 import {
   SESSION_COOKIE,
   clearCookieHeader,
+  cookiePolicy,
   sessionCookieHeaders,
   createApiKey,
   createSession,
@@ -31,12 +32,6 @@ export const authRouter = express.Router();
 const authLimiter = rateLimit({ windowMs: 10 * 60_000, max: 30, key: 'auth' });
 const registerLimiter = rateLimit({ windowMs: 60 * 60_000, max: 10, key: 'register' });
 
-const isSecureRequest = (req) => {
-  const proto = req.headers['x-forwarded-proto'];
-  if (typeof proto === 'string' && proto.split(',')[0].trim() === 'https') return true;
-  return req.secure;
-};
-
 function startSession(req, res, user, event) {
   const { token } = newSessionToken();
   const session = createSession({
@@ -45,7 +40,7 @@ function startSession(req, res, user, event) {
     userAgent: req.headers['user-agent'] || '',
     ip: clientIp(req),
   });
-  res.setHeader('Set-Cookie', sessionCookieHeaders(token, { secure: isSecureRequest(req) }));
+  res.setHeader('Set-Cookie', sessionCookieHeaders(token, cookiePolicy(req)));
   run('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?', now(), now(), user.id);
   audit({
     userId: user.id,
@@ -124,7 +119,7 @@ authRouter.post('/logout', (req, res) => {
     audit({ userId: req.user?.id || null, event: 'logout', status: 'ok', ip: clientIp(req), detail: sessionId });
     run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), sessionId);
   }
-  res.setHeader('Set-Cookie', clearCookieHeader({ secure: isSecureRequest(req) }));
+  res.setHeader('Set-Cookie', clearCookieHeader(cookiePolicy(req)));
   return res.json({ ok: true });
 });
 
@@ -260,7 +255,7 @@ authRouter.delete('/account', requireUser, async (req, res, next) => {
     }
     audit({ userId: null, email: user.email, event: 'account_delete', status: 'ok', ip: clientIp(req) });
     run('DELETE FROM users WHERE id = ?', user.id); // cascades to all user data
-    res.setHeader('Set-Cookie', clearCookieHeader({ secure: isSecureRequest(req) }));
+    res.setHeader('Set-Cookie', clearCookieHeader(cookiePolicy(req)));
     return res.json({ ok: true });
   } catch (error) {
     return next(error);
