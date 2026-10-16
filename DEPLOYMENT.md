@@ -34,23 +34,59 @@ You need a machine with a **public IP** that stays up. Any of these work:
 - **A PaaS** (Render, Railway, Fly.io) — the container image below runs as-is;
   see *PaaS* at the end.
 
+### Which host to pick
+
+The stack is Caddy + Blue + SearXNG in Docker, so **get 2 GB of RAM, not 1 GB**.
+Blue is small (a Node process and a SQLite file), but SearXNG is a Python app
+with four worker threads, and on a 1 GB box all three containers plus the Docker
+daemon leave it swapping or getting OOM-killed the moment a search runs. 2 GB is
+the honest floor for "it just works"; 1 GB works only if you drop the SearXNG
+service and use a search API key instead.
+
+| Pick | Spec | Price | Why |
+| --- | --- | --- | --- |
+| **Hetzner CX22** *(best value)* | 2 vCPU, 4 GB, 40 GB NVMe, 20 TB | ~€3.79–4.51/mo (~₹350–420) | Most RAM per rupee anywhere. Pick the **Singapore** region — it is their closest to India, so expect 40–60 ms rather than 10 ms. New accounts sometimes need a quick ID check, and billing is in EUR. |
+| **Vultr — Mumbai** | 1 vCPU, 2 GB, 50 GB NVMe, 2 TB | ~$12/mo (~₹1,050) | An actual Indian datacenter, so ~10–20 ms. Card billing, hourly, easy to destroy. |
+| **DigitalOcean — Bangalore (BLR1)** | 1 vCPU, 2 GB, 50 GB SSD, 2 TB | ~$12/mo (~₹1,050) | Same latency story as Vultr Mumbai, with the best documentation of the three. |
+| **Linode (Akamai) — Mumbai** | 1 vCPU, 2 GB, 50 GB SSD | ~$12/mo | Equivalent to the two above; free snapshots. |
+
+If you just want the cheapest thing that will hold up: **Hetzner CX22 in
+Singapore**. If you would rather keep the round trip inside India: **Vultr
+Mumbai or DigitalOcean Bangalore**. Either way the host needs to be a *plain
+Linux VPS* — the steps below install Docker on it — and whatever you pick must
+allow inbound **80** and **443**.
+
+> You do not need a domain-related product from the host. Your DNS already lives
+> at DNS Exit, and that is where step 2 happens.
+
 ### With Docker (recommended)
 
 ```bash
+# On the fresh host, as root (or a sudo user):
+curl -fsSL https://get.docker.com | sh
+
 git clone https://github.com/adarsh135/Project-Blue.git
 cd Project-Blue
 
 cp .env.deploy.example .env
-openssl rand -base64 48        # paste the output into BLUE_SESSION_SECRET
-nano .env                      # set BLUE_SESSION_SECRET and ACME_EMAIL
+openssl rand -base64 48        # paste into BLUE_SESSION_SECRET
+openssl rand -hex 32           # paste into SEARXNG_SECRET
+nano .env                      # set both secrets, DOMAIN, and ACME_EMAIL
 
 docker compose up -d --build
 docker compose logs -f caddy
 ```
 
-That starts two containers: Blue itself (bound only to the Docker network) and
-Caddy (bound to 80/443), with the SQLite database on a named volume so it
-survives rebuilds.
+That starts three containers:
+
+| Container | Reachable from | Role |
+| --- | --- | --- |
+| `blue` | the Docker network only | the app, on `/data` (named volume) so the database survives rebuilds |
+| `searxng` | the Docker network only | keyless search, configured by `searxng/settings.yml` |
+| `caddy` | the internet, on 80 + 443 | TLS, and the only thing exposed |
+
+Nothing but Caddy publishes a port, so the database and the search instance are
+not reachable from outside the host.
 
 ### Without Docker (systemd + Node)
 
@@ -212,31 +248,70 @@ curl -sI -X POST https://problue.run.place/api/auth/register \
 | `BLUE_SESSION_SECRET` | **Set it.** Without one, a secret is generated into the data volume; lose the volume and every session is invalidated. |
 | `PUBLIC_URL` | `https://problue.run.place`. Used for CSRF origin checks. |
 | `NODE_ENV=production` | Turns on HSTS and `X-Frame-Options`; do not serve publicly without it. |
-| `BLUE_SEARXNG_URL` | Makes `web_search` dependable without paying for an API key. See below. |
+| `SEARXNG_SECRET` | **Set it.** Signs SearXNG's own session cookies. `openssl rand -hex 32`. |
+| `DOMAIN` | The name Caddy gets a certificate for. Must match the DNS record. |
+| `ACME_EMAIL` | Let's Encrypt expiry notices. Optional but recommended. |
+| `BLUE_SEARXNG_URL` | Defaults to the bundled instance. See *About search* below. |
 | `OPENAI_API_KEY` etc. | Picks a real model. Without one, Blue answers from its offline engine. |
 
 ### About search
 
-If you set no search backend, `web_search` falls back to scraping DuckDuckGo,
-which is **throttled per IP** and will eventually answer your server with an
-anti-bot page. Blue detects that and tells you instead of pretending there were
-no results — but it is not a dependable production backend.
+**This is already set up for you.** SearXNG ships as the `searxng` service in
+`docker-compose.yml`, and the stack points Blue at it by default
+(`BLUE_SEARXNG_URL=http://searxng:8080`, resolved over the Docker network by
+service name). Nothing to configure, nothing to pay for.
 
-Two ways to fix it:
+That matters because the fallback lane — scraping DuckDuckGo — is **throttled
+per IP**, and a datacenter IP gets hit hardest of all. Blue detects that
+anti-bot page and says so rather than pretending there were no results, but it
+is not a dependable production backend. SearXNG is: it queries whatever engines
+the instance is configured with, and since only Blue can reach this instance,
+there is no public traffic to rate limit.
 
-```bash
-# Keyless: run SearXNG alongside Blue, add "json" to its search.formats
-docker run -d --name searxng -p 8080:8080 searxng/searxng
-# then set BLUE_SEARXNG_URL=http://searxng:8080 (same Docker network)
+`searxng/settings.yml` exists for one essential reason: SearXNG ships with
+`search.formats: [html]` only, and the JSON API that Blue calls has to be
+enabled explicitly. Without that file the instance answers `/search?format=json`
+with its HTML UI, and Blue reports exactly that.
+
+Precedence, if you configure more than one backend:
+
+```
+tavily  >  brave  >  serper  >  searxng  >  duckduckgo (scrape)
 ```
 
-Or set `TAVILY_API_KEY` / `BRAVE_API_KEY` / `SERPER_API_KEY`.
+Details worth knowing:
 
-Either way, confirm with:
+- **If SearXNG is unreachable** (still booting, or the container died), Blue
+  falls back to the keyless scrape for that search instead of failing, and
+  reports `duckduckgo` as the provider that actually answered. The tool summary
+  says the fallback happened.
+- **If SearXNG is misconfigured** (for example the JSON API is off), Blue does
+  *not* silently fall back. It raises an error naming the setting, because that
+  is a problem you are meant to fix, not one to route around.
+- **To use a different instance**, set `BLUE_SEARXNG_URL` in `.env`. To drop the
+  lane entirely, set it empty (`BLUE_SEARXNG_URL=`) and set `TAVILY_API_KEY` or
+  one of the others.
+
+Confirm which lane is live:
 
 ```bash
 curl -s https://problue.run.place/api/status | grep -o '"search":{[^}]*}'
 ```
+
+You want `"provider":"searxng"`. To check the instance itself, ask the *Blue*
+container to reach it — that also proves the `searxng` hostname resolves across
+the compose network, which is the thing the app actually depends on:
+
+```bash
+docker compose exec blue node -e "
+  fetch('http://searxng:8080/search?q=test&format=json')
+    .then(r => r.text())
+    .then(t => console.log(t.slice(0, 200)))
+"
+```
+
+A JSON body starting `{"query":...` means it is working. An HTML body means the
+`json` format is missing from `searxng/settings.yml`.
 
 ---
 
@@ -266,8 +341,24 @@ docker compose exec blue node -e "
 
 ## Troubleshooting
 
-**`web_search failed … anti-bot challenge`** — expected on the keyless lane.
-Set `BLUE_SEARXNG_URL` or a search API key.
+**`docker compose up` stops with `set SEARXNG_SECRET in .env`** — the bundled
+search instance refuses to start with a default secret. Run
+`openssl rand -hex 32` and paste it into `SEARXNG_SECRET`.
+
+**`web_search` reports it fell back to DuckDuckGo** — SearXNG was unreachable
+for that search. Check `docker compose ps` and `docker compose logs searxng`.
+The search still answered, so this is a warning rather than a failure; the
+`searxng_last` block in `/api/status` records the reason.
+
+**`web_search` fails with "…answered with text/html instead of JSON"** — the
+JSON API is off on that instance. `searxng/settings.yml` in this repo enables it
+under `search.formats`; if you edited that file, keep both `html` and `json`.
+Note that `search.formats` is *replaced*, not merged, so listing only `json`
+turns the web UI off.
+
+**`web_search failed … anti-bot challenge`** — you are on the keyless DuckDuckGo
+lane, meaning `BLUE_SEARXNG_URL` is empty and no API key is set. Either let it
+default to the bundled instance, or set one of the search keys.
 
 **Certificate never issues** — DNS not updated yet, or 80/443 blocked. Check
 `dig +short your.domain` first, then the Caddy log.

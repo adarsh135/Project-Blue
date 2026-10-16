@@ -106,6 +106,22 @@ function searchProvider() {
 }
 
 /**
+ * Raised when a SearXNG instance *answers* but is not configured the way Blue
+ * needs. Misconfiguration is reported rather than masked, because the message
+ * names the exact setting to change. An instance that is merely unreachable is
+ * a different failure and is allowed to fall back to the keyless lane.
+ */
+export class SearxngConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SearxngConfigError';
+  }
+}
+
+/** Last thing the SearXNG lane did, for GET /api/status. */
+let searxngLastOutcome = null;
+
+/**
  * Self-hosted SearXNG. Keyless, aggregates whatever engines the instance is
  * configured with, and is not the target of a per-IP anti-bot campaign the way
  * duckduckgo.com is — so it is the dependable path for anyone who cannot or
@@ -122,16 +138,21 @@ async function searchSearxng(query, max) {
 
   const res = await fetchWithTimeout(url, { timeoutMs: 12_000, headers: { accept: 'application/json' } });
   if (!res.ok) {
-    throw new Error(
-      `SearXNG ${res.status} ${res.statusText}`.trim() +
-        (res.status === 403 ? ` — ${config.searxngUrl} may need "json" added to search.formats.` : ''),
-    );
+    const hint =
+      res.status === 403 || res.status === 429
+        ? ` — ${config.searxngUrl} may need "json" added to search.formats.`
+        : '';
+    const message = `SearXNG ${res.status} ${res.statusText}`.trim() + hint;
+    // 4xx: the instance is up but unwilling, so the operator has to change a
+    // setting — report it. 5xx: the instance itself is failing, which is what
+    // the keyless fallback below is for.
+    throw res.status >= 400 && res.status < 500 ? new SearxngConfigError(message) : new Error(message);
   }
 
   const contentType = res.headers.get('content-type') || '';
   const raw = await res.text();
   if (!contentType.includes('json')) {
-    throw new Error(
+    throw new SearxngConfigError(
       `SearXNG at ${config.searxngUrl} answered with ${contentType || 'an unknown content type'} instead of JSON. ` +
         'Add "json" to its search.formats setting, or point BLUE_SEARXNG_URL at an instance that has it enabled.',
     );
@@ -141,7 +162,7 @@ async function searchSearxng(query, max) {
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`SearXNG at ${config.searxngUrl} returned a body that is not valid JSON.`);
+    throw new SearxngConfigError(`SearXNG at ${config.searxngUrl} returned a body that is not valid JSON.`);
   }
 
   return {
@@ -395,6 +416,7 @@ export function searchHealth() {
     keyless: provider === 'duckduckgo' || provider === 'searxng',
     instance: provider === 'searxng' ? config.searxngUrl : undefined,
     last: ddgLastOutcome,
+    searxng_last: searxngLastOutcome,
   };
 }
 
@@ -413,8 +435,39 @@ export async function runWebSearch(query, maxResults = 5) {
     searxng: searchSearxng,
     duckduckgo: searchDuckDuckGo,
   }[provider];
-  const { answer, results } = await handler(q, max);
-  return { provider, query: q, answer, results };
+
+  try {
+    const { answer, results } = await handler(q, max);
+    if (provider === 'searxng') searxngLastOutcome = { ok: true, at: new Date().toISOString() };
+    return { provider, query: q, answer, results };
+  } catch (error) {
+    // A *misconfigured* instance is reported, never papered over: the message
+    // names the setting to change. An instance that is unreachable or crashing
+    // is a different failure, so try the keyless scrape lane rather than losing
+    // the search — and name the lane that actually answered, so the degradation
+    // is visible instead of silent.
+    if (provider !== 'searxng' || error instanceof SearxngConfigError) throw error;
+
+    searxngLastOutcome = { ok: false, at: new Date().toISOString(), reason: error.message };
+
+    let fallback;
+    try {
+      fallback = await searchDuckDuckGo(q, max);
+    } catch (fallbackError) {
+      throw new Error(
+        `SearXNG at ${config.searxngUrl} failed (${error.message}), and the keyless fallback failed too ` +
+          `(${fallbackError.message}).`,
+      );
+    }
+
+    return {
+      provider: 'duckduckgo',
+      query: q,
+      answer: fallback.answer,
+      results: fallback.results,
+      degraded: { configured: 'searxng', instance: config.searxngUrl, reason: error.message },
+    };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -515,7 +568,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
     switch (name) {
       case 'web_search': {
         try {
-          const { provider, query, answer, results } = await runWebSearch(args.query, args.max_results);
+          const { provider, query, answer, results, degraded } = await runWebSearch(args.query, args.max_results);
           recordSearch({ userId, chatSessionId, query, provider, results, source: 'agent' });
           return {
             ok: true,
@@ -523,7 +576,10 @@ export async function executeTool(name, args = {}, ctx = {}) {
             query,
             answer: answer || undefined,
             results,
-            summary: `${results.length} result(s) from ${provider} for "${truncate(query, 80)}"`,
+            degraded,
+            summary:
+              `${results.length} result(s) from ${provider} for "${truncate(query, 80)}"` +
+              (degraded ? ` (SearXNG unreachable, fell back: ${degraded.reason})` : ''),
           };
         } catch (error) {
           // Keep the attempt in the user's search history, flagged as unavailable.

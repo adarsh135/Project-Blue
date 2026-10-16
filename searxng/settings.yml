@@ -1,0 +1,31 @@
+# SearXNG for Project Blue.
+#
+# This is an *override* file: it is merged on top of the defaults that ship
+# inside the image, so only the settings Blue actually needs are listed here.
+# Reference: https://docs.searxng.org/admin/settings/
+#
+# The instance is reachable only from the compose network — docker-compose.yml
+# publishes no port for it — so it is not a public search engine. That is also
+# why the limiter stays off: there is no public traffic to rate limit, and
+# leaving it off avoids needing the valkey sidecar that the upstream public
+# compose file runs (valkey.url defaults to false).
+
+use_default_settings: true
+
+server:
+  # Both are also settable from docker-compose.yml via ${SEARXNG_SECRET} and
+  # ${SEARXNG_BASE_URL}, which exist so no secret has to live in this file.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # Upstream defaults this to `[html]` alone, and a list is replaced wholesale
+  # rather than merged — so `json` has to be listed explicitly, html included.
+  #
+  # Blue's web_search tool calls /search?format=json and checks the response
+  # content type. Without `json` here the instance answers with its HTML UI,
+  # and Blue reports that as a configuration error telling you to add it.
+  formats:
+    - html
+    - json

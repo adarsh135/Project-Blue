@@ -11,5 +11,8 @@ Dockerfile
 docker-compose.yml
 Caddyfile
 DEPLOYMENT.md
+# Config for the separate searxng container, bind-mounted at runtime — the Blue
+# image itself never needs it.
+searxng
 README.md
 LICENSE

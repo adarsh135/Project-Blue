@@ -237,3 +237,89 @@ test('a commercial API key still outranks a configured SearXNG instance', async 
     }
   });
 });
+
+/** A port that was just released, so connecting to it is refused immediately. */
+async function deadPortUrl() {
+  const server = http.createServer(() => {});
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return `http://127.0.0.1:${port}`;
+}
+
+test('an unreachable SearXNG degrades to the keyless scrape instead of losing the search', async () => {
+  await withStubServer('serp', async ({ base }) => {
+    const savedDdg = config.searchDdgBase;
+    const savedSearxng = config.searxngUrl;
+    config.searchDdgBase = base;
+    config.searxngUrl = await deadPortUrl();
+    try {
+      const out = await runWebSearch('node lts release', 5);
+
+      // The lane that actually answered is the one reported, so a degradation
+      // can never be mistaken for the configured provider having worked.
+      assert.equal(out.provider, 'duckduckgo');
+      assert.ok(out.results.length >= 1, 'the fallback lane must return results');
+      assert.equal(out.degraded.configured, 'searxng');
+      assert.equal(out.degraded.instance, config.searxngUrl);
+      assert.ok(out.degraded.reason, 'the reason SearXNG was skipped must be recorded');
+
+      // Config is untouched: SearXNG is still the selected lane, just failing.
+      assert.equal(searchHealth().provider, 'searxng');
+      assert.equal(searchHealth().searxng_last.ok, false);
+      assert.ok(searchHealth().searxng_last.reason);
+    } finally {
+      config.searchDdgBase = savedDdg;
+      config.searxngUrl = savedSearxng;
+    }
+  });
+});
+
+test('a 5xx from SearXNG falls back, while an unreachable fallback reports both failures', async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(503, { 'content-type': 'text/plain' });
+    res.end('upstream is down');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const broken = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    await withStubServer('serp', async ({ base }) => {
+      const savedDdg = config.searchDdgBase;
+      const savedSearxng = config.searxngUrl;
+      config.searchDdgBase = base;
+      config.searxngUrl = broken;
+      try {
+        const out = await runWebSearch('node lts release', 5);
+        assert.equal(out.provider, 'duckduckgo');
+        assert.match(out.degraded.reason, /503/);
+      } finally {
+        config.searchDdgBase = savedDdg;
+        config.searxngUrl = savedSearxng;
+      }
+    });
+
+    // Both lanes down: the error has to name both, not just the last one tried.
+    // The fallback base is pointed at a closed port too, so this asserts the
+    // same thing on a machine where duckduckgo.com is actually reachable.
+    const savedSearxng = config.searxngUrl;
+    const savedDdg = config.searchDdgBase;
+    config.searxngUrl = broken;
+    config.searchDdgBase = await deadPortUrl();
+    try {
+      await assert.rejects(
+        () => runWebSearch('node lts release', 5),
+        (error) => {
+          assert.match(error.message, /SearXNG at .* failed/);
+          assert.match(error.message, /keyless fallback failed/);
+          return true;
+        },
+      );
+    } finally {
+      config.searxngUrl = savedSearxng;
+      config.searchDdgBase = savedDdg;
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

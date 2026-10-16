@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-76%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-78%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -176,19 +176,32 @@ curl -X POST localhost:4000/api/chat \
 Tavily → Brave → Serper → SearXNG → keyless DuckDuckGo
 ```
 
-The first three need a key. **SearXNG is the keyless option that actually holds up** — point
-`BLUE_SEARXNG_URL` at your own instance and search no longer depends on somebody else's
-throttling policy. It aggregates whatever engines you configure on it, and there is no per-IP
-anti-bot campaign aimed at a private instance:
+The first three need a key. **SearXNG is the keyless option that actually holds up** — search
+no longer depends on somebody else's throttling policy. It aggregates whatever engines its
+instance is configured with, and there is no per-IP anti-bot campaign aimed at a private
+instance.
+
+`docker-compose.yml` runs one next to Blue and points the app at it, so the hosted path needs
+no configuration. To run it by hand:
 
 ```bash
-docker run -d -p 8080:8080 searxng/searxng
+docker run -d --name searxng -p 8080:8080 searxng/searxng
 # then, in .env:
 BLUE_SEARXNG_URL=http://localhost:8080
 ```
 
-The instance needs `json` in its `search.formats` setting. If it is missing, Blue detects the
-HTML response and says exactly that rather than failing vaguely.
+The instance needs `json` in its `search.formats` setting — the image defaults to `html` only.
+`searxng/settings.yml` enables it for the bundled service; a hand-rolled `docker run` like the
+one above will answer with HTML, and Blue detects that and says exactly which setting to change
+rather than failing vaguely.
+
+Two failure modes are deliberately treated differently:
+
+* **Unreachable** (still booting, container died) — Blue falls back to the keyless scrape for
+  that search and reports `duckduckgo` as the provider that actually answered, so a degradation
+  is never mistaken for the configured backend having worked.
+* **Misconfigured** — no silent fallback. The error names the setting, because that is a bug to
+  fix, not one to route around.
 
 Only with none of the above does `web_search` fall back to DuckDuckGo's keyless endpoints: the
 Instant Answer API for entity/definition facts, then the `html.duckduckgo.com` and
@@ -297,7 +310,7 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
 | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
 | `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | commercial search providers (see *Web search* below) |
-| `BLUE_SEARXNG_URL` | – | self-hosted SearXNG — keyless and dependable |
+| `BLUE_SEARXNG_URL` | `http://searxng:8080` in Compose | self-hosted SearXNG — keyless and dependable; empty drops the lane |
 | `BLUE_SEARCH_MIN_INTERVAL_MS` | `3000` | spacing between keyless DuckDuckGo requests |
 | `BLUE_SEARCH_DDG_BASE` | – | send keyless lanes to a mirror/proxy instead of duckduckgo.com |
 
@@ -306,7 +319,7 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 ## Tests
 
 ```bash
-npm test        # 76 tests, ~8s, no network required
+npm test        # 78 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -316,7 +329,7 @@ npm test        # 76 tests, ~8s, no network required
 * `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
 * `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
 * `tests/compatibility.test.js` — no default model is one a vendor has retired, retired-ID errors name their replacement, and a DuckDuckGo anti-bot challenge is reported as a block rather than as "no results"
-* `tests/search-live.test.js` — the search lanes against a **real HTTP server on a real socket**: a real 202 is detected, the POST body and `Referer` really arrive, lane fallback works, and a SearXNG instance is consumed as JSON and explained when it is not
+* `tests/search-live.test.js` — the search lanes against a **real HTTP server on a real socket**: a real 202 is detected, the POST body and `Referer` really arrive, lane fallback works, a SearXNG instance is consumed as JSON and explained when it is not, and an unreachable one degrades to the keyless lane while a misconfigured one refuses to
 
 ---
 
@@ -346,9 +359,10 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                76 tests
+tests/                78 tests
 Dockerfile            production image (Node 22, non-root, healthcheck)
-docker-compose.yml    app + Caddy, with the database on a named volume
+docker-compose.yml    Blue + SearXNG + Caddy; database on a named volume
+searxng/settings.yml  instance config — enables the JSON API Blue calls
 Caddyfile             automatic HTTPS, SSE-aware proxy config
 DEPLOYMENT.md         domain, TLS and backup walkthrough
 docs/ARCHITECTURE.md  data model, flows, SSE protocol

@@ -32,10 +32,15 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
-      # ---- optional: search backend. Without one, web_search uses the keyless
-      # DuckDuckGo lane, which is throttled per IP. SearXNG is keyless and
-      # dependable; see DEPLOYMENT.md.
-      BLUE_SEARXNG_URL: ${BLUE_SEARXNG_URL:-}
+      # ---- search backend. Defaults to the bundled searxng service below,
+      # which is keyless and does not get throttled the way a datacenter IP
+      # scraping duckduckgo.com does. Set BLUE_SEARXNG_URL in .env to point at
+      # an external instance, or to an empty value to drop this lane and use
+      # the keyless DuckDuckGo scrape instead. A configured-but-unreachable
+      # instance falls back to that scrape rather than failing the search.
+      # `-` not `:-`: an explicitly empty BLUE_SEARXNG_URL in .env must be able
+      # to switch this lane off, while leaving it unset gets the bundled one.
+      BLUE_SEARXNG_URL: ${BLUE_SEARXNG_URL-http://searxng:8080}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       BRAVE_API_KEY: ${BRAVE_API_KEY:-}
       SERPER_API_KEY: ${SERPER_API_KEY:-}
@@ -44,6 +49,31 @@ services:
       - blue-data:/data
     expose:
       - "4000"
+    # Ordered after SearXNG so the search lane is usually up by the time the
+    # first chat runs. This waits for *start*, not readiness: if the instance is
+    # still booting, runWebSearch falls back to the keyless scrape instead of
+    # failing, so a slow start never costs the user a reply.
+    depends_on:
+      searxng:
+        condition: service_started
+
+  # Keyless search lane. Deliberately publishes no ports: the only thing that
+  # can reach it is Blue, over the compose network, by the name `searxng`.
+  searxng:
+    image: searxng/searxng:${SEARXNG_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      # Signs its own session cookies. Generate with `openssl rand -hex 32`.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080/}
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PUBLIC_INSTANCE: "false"
+    volumes:
+      # `json` is enabled for Blue in this file; see searxng/settings.yml.
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    expose:
+      - "8080"
 
   caddy:
     image: caddy:2-alpine
@@ -65,5 +95,6 @@ services:
 
 volumes:
   blue-data:
+  searxng-cache:
   caddy-data:
   caddy-config:
