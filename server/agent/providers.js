@@ -20,10 +20,12 @@ async function* openaiStream({ apiKey, baseUrl, model, messages, tools, temperat
   const body = {
     model,
     messages,
-    temperature,
     stream: true,
     stream_options: { include_usage: true },
   };
+  // Newer GPT-5/6 families manage reasoning/sampling internally and may reject
+  // the legacy temperature parameter. Keep it for compatible GPT-4-era models.
+  if (!/^gpt-(?:5|6)(?:[.-]|$)/i.test(String(model || ''))) body.temperature = temperature;
   if (tools?.length) {
     body.tools = tools.map((t) => ({ type: 'function', function: t }));
     body.tool_choice = 'auto';
@@ -164,11 +166,16 @@ async function* anthropicStream({ apiKey, baseUrl, model, system, messages, tool
 }
 
 async function* geminiStream({ apiKey, baseUrl, model, system, contents, tools, temperature, signal }) {
-  const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  // Never put provider credentials in a URL: URLs commonly reach access logs.
+  const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+  const generationConfig = { maxOutputTokens: 4096 };
+  // Gemini 3+ models no longer accept legacy sampling parameters.
+  const major = /^gemini-(\\d+)/i.exec(String(model || ''));
+  if (!major || Number(major[1]) < 3) generationConfig.temperature = temperature;
   const body = {
     contents,
     systemInstruction: system ? { parts: [{ text: system }] } : undefined,
-    generationConfig: { temperature, maxOutputTokens: 4096 },
+    generationConfig,
   };
   if (tools?.length) {
     body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: sanitizeSchema(t.parameters) })) }];
@@ -176,7 +183,7 @@ async function* geminiStream({ apiKey, baseUrl, model, system, contents, tools, 
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify(body),
     signal,
   });
