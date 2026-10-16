@@ -8,7 +8,7 @@ process.env.BLUE_LOCAL_TOKEN_DELAY_MS = '0';
 process.env.BLUE_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'blue-engine-test-'));
 process.env.BLUE_SEARCH_OFFLINE = 'true';
 
-const { detectIntent, runLocalEngine } = await import('../server/agent/local-engine.js');
+const { detectIntent, extractUrl, runLocalEngine } = await import('../server/agent/local-engine.js');
 
 const collect = async (messages, { tools = [], context = { userId: 'u_test' } } = {}) => {
   const events = [];
@@ -32,6 +32,36 @@ test('intent: routes questions to the right tool', () => {
   assert.equal(detectIntent('show my recent searches').kind, 'search_history');
   assert.equal(detectIntent('find in my chats about sqlite').kind, 'session_search');
   assert.equal(detectIntent('explain how a thread pool works').kind, 'general');
+});
+
+test('intent: pasted URLs route to the page reader rather than a generic answer', () => {
+  assert.equal(detectIntent('fetch https://api.github.com/repos/nodejs/node').kind, 'fetch_page');
+  assert.equal(detectIntent('https://example.com').kind, 'fetch_page');
+  assert.equal(detectIntent('read https://nodejs.org/en/blog and summarise it').kind, 'fetch_page');
+  assert.equal(detectIntent('open example.com/docs and summarize').kind, 'fetch_page');
+  assert.equal(detectIntent('summarize this page https://api.github.com/repos/nodejs/node').kind, 'fetch_page');
+  assert.equal(extractUrl('open example.com/docs'), 'example.com/docs');
+  assert.equal(extractUrl('explain how node.js handles the event loop'), '');
+  assert.equal(extractUrl('my email is someone@internal.test'), '');
+  assert.equal(extractUrl('calc 1.5 * 4'), '');
+  assert.equal(detectIntent('search the web for node lts release notes').kind, 'web_search');
+});
+
+test('engine: URL intent asks the enabled fetch_page tool to read the source', async () => {
+  const { toolCalls, text } = await collect([{ role: 'user', content: 'read https://nodejs.org/en/blog and summarise it' }], {
+    tools: [{ name: 'fetch_page' }],
+  });
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0].name, 'fetch_page');
+  assert.equal(JSON.parse(toolCalls[0].args).url, 'https://nodejs.org/en/blog');
+  assert.match(text, /Fetching/);
+});
+
+test('engine: explains when URL reading is switched off', async () => {
+  const { text, toolCalls } = await collect([{ role: 'user', content: 'read https://example.com' }], { tools: [] });
+  assert.equal(toolCalls.length, 0);
+  assert.match(text, /switched off/i);
+  assert.match(text, /fetch_page/);
 });
 
 test('engine: identity answer mentions the credential/session features', async () => {
