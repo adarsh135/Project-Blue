@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-79%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-76%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -249,6 +249,26 @@ rather than the legacy `?key=` query parameter, and sampling parameters (`temper
 
 ---
 
+## Deployment
+
+One command on any host with a public IP — Docker Compose plus Caddy, which
+obtains and renews the TLS certificate for your domain automatically:
+
+```bash
+cp .env.deploy.example .env      # set BLUE_SESSION_SECRET, DOMAIN, ACME_EMAIL
+docker compose up -d --build
+```
+
+Then point an **A record** at the host's public IP. Full walkthrough, including
+a systemd-only path and the DNS steps, is in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+Two things that catch people out, both covered there: a DNS record says which
+IP serves the name and nothing more — something has to be listening on that IP
+first — and the reverse proxy must not buffer responses, because chat answers
+stream over SSE and will otherwise arrive in one lump at the end.
+
+---
+
 ## Security notes
 
 * **Passwords** — scrypt (`N=32768, r=8, p=1`, 64-byte key, per-user random salt). Login failures are indistinguishable between "unknown email" and "wrong password".
@@ -286,7 +306,7 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 ## Tests
 
 ```bash
-npm test        # 79 tests, ~8s, no network required
+npm test        # 76 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -326,7 +346,11 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                79 tests
+tests/                76 tests
+Dockerfile            production image (Node 22, non-root, healthcheck)
+docker-compose.yml    app + Caddy, with the database on a named volume
+Caddyfile             automatic HTTPS, SSE-aware proxy config
+DEPLOYMENT.md         domain, TLS and backup walkthrough
 docs/ARCHITECTURE.md  data model, flows, SSE protocol
 ```
 
@@ -339,7 +363,7 @@ docs/ARCHITECTURE.md  data model, flows, SSE protocol
 - [ ] Multi-user spaces, sharing and read-only links
 - [ ] Background jobs (scheduled searches, digests)
 - [ ] Postgres adapter for horizontal scale
-- [ ] Docker image
+- [x] Docker image (`Dockerfile` + `docker-compose.yml` + `Caddyfile`, see [DEPLOYMENT.md](DEPLOYMENT.md))
 
 ## License
 

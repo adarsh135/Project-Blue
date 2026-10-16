@@ -1,0 +1,15 @@
+node_modules
+data
+.git
+.gitignore
+.env
+.env.local
+*.log
+tests
+docs
+Dockerfile
+docker-compose.yml
+Caddyfile
+DEPLOYMENT.md
+README.md
+LICENSE

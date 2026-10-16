@@ -124,7 +124,7 @@ authRouter.post('/logout', (req, res) => {
     audit({ userId: req.user?.id || null, event: 'logout', status: 'ok', ip: clientIp(req), detail: sessionId });
     run('UPDATE sessions SET revoked_at = ? WHERE id = ?', now(), sessionId);
   }
-  res.setHeader('Set-Cookie', clearCookieHeader());
+  res.setHeader('Set-Cookie', clearCookieHeader({ secure: isSecureRequest(req) }));
   return res.json({ ok: true });
 });
 
@@ -260,7 +260,7 @@ authRouter.delete('/account', requireUser, async (req, res, next) => {
     }
     audit({ userId: null, email: user.email, event: 'account_delete', status: 'ok', ip: clientIp(req) });
     run('DELETE FROM users WHERE id = ?', user.id); // cascades to all user data
-    res.setHeader('Set-Cookie', clearCookieHeader());
+    res.setHeader('Set-Cookie', clearCookieHeader({ secure: isSecureRequest(req) }));
     return res.json({ ok: true });
   } catch (error) {
     return next(error);

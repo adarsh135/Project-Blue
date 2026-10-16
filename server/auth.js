@@ -215,8 +215,16 @@ export function cookieHeader(token, { maxAgeSeconds = config.sessionTtlHours * 3
   return attrs.join('; ');
 }
 
-export const clearCookieHeader = () =>
-  [`${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`, `${CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0`];
+/**
+ * The CSRF cookie stays readable by JS (that is the point of double-submit) but
+ * still needs `Secure` on HTTPS: without it the token can be read off a
+ * plaintext request to the same host, which is exactly what a network attacker
+ * would need to forge a state-changing call.
+ */
+export const clearCookieHeader = ({ secure = false } = {}) => {
+  const tail = `Path=/; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`;
+  return [`${SESSION_COOKIE}=; HttpOnly; ${tail}`, `${CSRF_COOKIE}=; ${tail}`];
+};
 
 export const CSRF_COOKIE = 'blue_csrf';
 
@@ -229,7 +237,7 @@ export function sessionCookieHeaders(token, { maxAgeSeconds = config.sessionTtlH
   const csrf = crypto.randomBytes(18).toString('base64url');
   return [
     cookieHeader(token, { maxAgeSeconds, secure }),
-    `${CSRF_COOKIE}=${csrf}; Path=/; SameSite=Lax; Max-Age=${maxAgeSeconds}`,
+    `${CSRF_COOKIE}=${csrf}; Path=/; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`,
   ];
 }
 

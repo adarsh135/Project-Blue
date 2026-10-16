@@ -411,3 +411,43 @@ test('settings drive the provider, model and enabled tools', async () => {
     body: { tools_enabled: ['web_search', 'fetch_page', 'calculator', 'clock', 'memory', 'session_search', 'search_history'] },
   });
 });
+
+/**
+ * Cookie flags on a public HTTPS deployment.
+ *
+ * The app sits behind a TLS-terminating proxy in production, so it decides
+ * `Secure` from X-Forwarded-Proto. Both cookies must carry it: the CSRF token
+ * is readable by design, but if it can be read off a plaintext request to the
+ * same host then an on-path attacker has exactly what they need to forge a
+ * state-changing call.
+ */
+test('both cookies are marked Secure when the request arrived over HTTPS', async () => {
+  const client = new Client();
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
+    body: JSON.stringify({ email: `secure-${Date.now()}@example.com`, password: 'Sup3rSecret1' }),
+  });
+  assert.equal(res.status, 201);
+
+  const cookies = res.headers.getSetCookie();
+  const session = cookies.find((c) => c.startsWith('blue_session='));
+  const csrf = cookies.find((c) => c.startsWith('blue_csrf='));
+  assert.ok(session && csrf, 'both cookies should be set on register');
+  assert.match(session, /;\s*Secure/i, 'session cookie must be Secure over HTTPS');
+  assert.match(session, /HttpOnly/i, 'session cookie must stay HttpOnly');
+  assert.match(csrf, /;\s*Secure/i, 'CSRF cookie must be Secure over HTTPS too');
+  assert.ok(!/HttpOnly/i.test(csrf), 'the CSRF cookie must remain readable by the double-submit script');
+});
+
+test('cookies are not Secure over plain HTTP, so local development still works', async () => {
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: `plain-${Date.now()}@example.com`, password: 'Sup3rSecret1' }),
+  });
+  assert.equal(res.status, 201);
+  for (const cookie of res.headers.getSetCookie()) {
+    assert.ok(!/;\s*Secure/i.test(cookie), `unexpected Secure on http: ${cookie}`);
+  }
+});
