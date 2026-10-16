@@ -1,16 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { neonConfig } from '@neondatabase/serverless';
 
-// Credentials live only in this request's asynchronous context, never in SQL,
-// settings, model messages, cookies, or a process-global mutable credential slot.
+// Only this request's asynchronous context owns the plaintext credential.
 export const credentialContext = new AsyncLocalStorage();
 export const visitorKey = () => credentialContext.getStore()?.key || '';
 const upstreamFetch = globalThis.fetch;
 const endpoints = new Set([
   'https://api.openai.com/v1/chat/completions',
   'https://api.anthropic.com/v1/messages',
-  'https://generativelanguage.googleapis.com/v1beta',
 ]);
-
 export function validateVisitorKey(value) {
   if (value === undefined) return '';
   if (typeof value !== 'string' || value.length < 8 || value.length > 512 || !/^[\x21-\x7e]+$/.test(value)) {
@@ -19,10 +17,12 @@ export function validateVisitorKey(value) {
   return value;
 }
 
-// This guard is installed only in public BYOK mode. All outbound agent/tool
-// traffic must pass an exact provider endpoint allowlist. It intentionally
-// disables arbitrary page fetches, search and Ollama, including redirect SSRF.
+// Public-mode outbound policy for the existing model AND tool adapters.
+// Neon is trusted server-owned infrastructure, not an agent/tool request: give
+// its driver a separate transport so migrations/auth/SQL still work without a
+// visitor key. Never attach a visitor credential to database traffic.
 export function installPublicTransport() {
+  neonConfig.fetchFunction = upstreamFetch;
   globalThis.fetch = async (input, options = {}) => {
     const key = visitorKey();
     const fail = () => { throw new Error('Provider request failed. Check your key, model, quota and provider availability.'); };
@@ -31,7 +31,7 @@ export function installPublicTransport() {
     try { url = new URL(String(input)); } catch { return fail(); }
     const gemini = url.origin === 'https://generativelanguage.googleapis.com' &&
       /^\/v1beta\/models\/[A-Za-z0-9._-]+:streamGenerateContent$/.test(url.pathname);
-    const exact = endpoints.has(`${url.origin}${url.pathname}`) && !gemini;
+    const exact = endpoints.has(`${url.origin}${url.pathname}`);
     if ((!exact && !gemini) || url.username || url.password || url.hash || options.method !== 'POST') return fail();
     const headers = new Headers(options.headers);
     const credentialMatches = gemini
@@ -43,16 +43,12 @@ export function installPublicTransport() {
       headers.set('x-goog-api-key', key);
     }
     try {
-      const signal = options.signal
-        ? AbortSignal.any([options.signal, AbortSignal.timeout(45_000)])
-        : AbortSignal.timeout(45_000);
+      const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000);
       const response = await upstreamFetch(url, { ...options, headers, redirect: 'error', signal });
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         return fail();
       }
-      // Wrap body iteration too: SDK/native errors must not expose request URLs,
-      // authorization headers or upstream response bodies to logs/SSE/storage.
       const reader = response.body.getReader();
       const body = new ReadableStream({
         async pull(controller) {
@@ -67,16 +63,23 @@ export function installPublicTransport() {
     } catch { return fail(); }
   };
 }
-
 export function publicCredentialMiddleware(req, res, next) {
   let key;
   try { key = validateVisitorKey(req.headers['x-blue-provider-key']); }
   catch (error) { return res.status(400).json({ error: error.message }); }
-  // Strip credentials from the request object before downstream logging/errors.
   delete req.headers['x-blue-provider-key'];
+  if (Array.isArray(req.rawHeaders)) {
+    for (let i = req.rawHeaders.length - 2; i >= 0; i -= 2) {
+      if (req.rawHeaders[i].toLowerCase() === 'x-blue-provider-key') req.rawHeaders.splice(i, 2);
+    }
+  }
   const chat = req.method === 'POST' && (req.path === '/api/chat' || /^\/api\/sessions\/[^/]+\/messages$/.test(req.path));
   if (chat && req.body?.provider !== 'local' && !key) {
     return res.status(400).json({ error: 'A visitor-owned provider key is required. Select Blue Local Engine explicitly for offline chat.' });
   }
-  return credentialContext.run({ key }, next);
+  const context = { key: chat ? key : '' };
+  const clear = () => { context.key = ''; };
+  res.once('finish', clear);
+  res.once('close', clear);
+  return credentialContext.run(context, next);
 }
