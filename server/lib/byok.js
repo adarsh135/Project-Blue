@@ -47,7 +47,9 @@ export function installPublicTransport() {
       url.searchParams.getAll('q').length === 1 &&
       url.searchParams.get('q').trim().length > 0 &&
       url.searchParams.get('q').length <= 500 &&
+      url.searchParams.getAll('format').length === 1 &&
       url.searchParams.get('format') === 'json' &&
+      url.searchParams.getAll('no_html').length === 1 &&
       url.searchParams.get('no_html') === '1';
     let safeHtml = false;
     if (isDdgHtml && method === 'POST' && !url.search && typeof options.body === 'string') {
