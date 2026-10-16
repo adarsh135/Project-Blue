@@ -7,8 +7,8 @@ export function csrfToken() {
 export class ApiError extends Error {
   constructor(message, status, data) { super(message); this.status = status; this.data = data; }
 }
-export async function api(path, { method = 'GET', body, headers = {}, raw = false } = {}) {
-  const options = { method, credentials: 'same-origin', headers: { ...headers } };
+export async function api(path, { method = 'GET', body, headers = {}, raw = false, signal } = {}) {
+  const options = { method, signal, credentials: 'same-origin', headers: { ...headers } };
   if (path === '/api/auth/logout') clearVisitorKey();
   if (path === '/api/chat' && method === 'POST') Object.assign(options.headers, await visitorHeaders(body));
   if (body !== undefined) {

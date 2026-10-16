@@ -36,7 +36,7 @@ after(async () => {
 
 test('Vercel routes the site to one Node function and includes its static assets', () => {
   assert.equal(vercelConfig.functions['api/index.js'].maxDuration, 60);
-  assert.equal(vercelConfig.functions['api/index.js'].includeFiles, 'public/**');
+  assert.equal(vercelConfig.functions['api/index.js'].includeFiles, '{public,skills}/**');
   assert.ok(vercelConfig.rewrites.some((route) => route.source === '/(.*)' && route.destination === '/api'));
   const responseHeaders = vercelConfig.headers[0].headers;
   assert.ok(responseHeaders.some((header) => header.key === 'Content-Security-Policy'));

@@ -101,6 +101,7 @@
         <button class="nav-item active" data-view="chat"><span class="ic">💬</span> Chat</button>
         <button class="nav-item" data-view="searches"><span class="ic">🔎</span> Recent searches <span class="count" id="count-searches">0</span></button>
         <button class="nav-item" data-view="memories"><span class="ic">🧠</span> Memory <span class="count" id="count-memories">0</span></button>
+        <button class="nav-item" data-view="workspace"><span class="ic">◈</span> Agents &amp; skills</button>
         <button class="nav-item" data-view="tools"><span class="ic">🧰</span> Tools</button>
         <button class="nav-item" data-view="settings"><span class="ic">⚙️</span> Settings</button>
         <button class="nav-item" data-view="account"><span class="ic">🔐</span> Account &amp; sessions</button>
@@ -246,6 +247,13 @@
       </div>
     </section>
 
+    <section class="view" id="view-workspace" style="display:none"><div class="view-inner">
+      <div class="card"><p class="muted small">BLUE WORKSPACE</p><h2>Your team. Your tools.</h2><p class="desc">Create specialists, give them skills and run a task through up to three agents. Select a connected model in Settings for AI reasoning. Local mode provides deterministic tools only.</p><div id="workspace-status" role="status"></div></div>
+      <div class="card"><h3>Agent team</h3><div id="workspace-agents"></div><form id="agent-form"><input id="agent-id" type="hidden"><div class="field"><label for="agent-name">Agent name</label><input class="input" id="agent-name" maxlength="80" required></div><div class="field"><label for="agent-instructions">Instructions</label><textarea class="textarea" id="agent-instructions" maxlength="6000" required></textarea></div><fieldset><legend>Skills (up to 3)</legend><div id="agent-skills"></div></fieldset><fieldset><legend>Allowed tools</legend><div id="agent-tools"></div></fieldset><button class="btn btn-primary" type="submit">Save agent</button><button class="btn" type="reset">New agent</button></form></div>
+      <div class="card"><h3>Run a team task</h3><p class="desc">Agents run in the order you select. Each receives the previous agent’s output. Keep this tab open; this is a foreground workflow. Each step uses your selected model and may incur provider charges.</p><div id="team-selection"></div><label for="team-task">Task</label><textarea class="textarea" id="team-task" maxlength="10000" placeholder="Research a problem, propose a solution, then review it."></textarea><div class="row"><button class="btn btn-primary" id="team-run">Run selected agents</button><button class="btn" id="team-stop" disabled>Stop</button></div><div id="team-results" aria-live="polite"></div></div>
+      <div class="card"><h3>Skill library</h3><p class="desc">Skills add instructions, not permissions or new tools. Review any instructions before saving.</p><div id="workspace-skills"></div><form id="skill-form"><input id="skill-id" type="hidden"><label for="skill-name">Skill name</label><input class="input" id="skill-name" maxlength="80" required><label for="skill-instructions">Instructions</label><textarea class="textarea" id="skill-instructions" maxlength="6000" required></textarea><button class="btn btn-primary" type="submit">Save skill</button><button class="btn" type="reset">New skill</button></form></div>
+      <div class="card"><h3>App connections</h3><p class="desc">Connect public GitHub repositories for read-only metadata, README and open issues. Private repositories, app writes, OAuth and arbitrary MCP servers are not supported in this version.</p><div id="workspace-connections"></div><form id="connection-form"><label for="connection-name">Connection name</label><input class="input" id="connection-name" maxlength="80" required><label for="connection-repository">Public repository</label><input class="input" id="connection-repository" placeholder="adarsh135/Project-Blue" required><button class="btn btn-primary" type="submit">Connect repository</button></form></div>
+    </div></section>
     <!-- settings view -->
     <section class="view" id="view-settings" style="display:none">
       <div class="view-inner">
@@ -278,7 +286,7 @@
 
         <div class="card">
           <h3>🔌 Configured providers</h3>
-          <p class="desc">Providers are enabled by environment variables on the server. Add a key to <code>.env</code> and restart — no code changes needed.</p>
+          <p class="desc">On public hosting, enter your own provider key in the key panel and choose its matching provider and model. No model key is needed for the limited Local Engine.</p>
           <div id="provider-list"></div>
           <pre class="mono small" style="background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto">OPENAI_API_KEY=sk-…        # OpenAI or any compatible endpoint
 ANTHROPIC_API_KEY=sk-ant-…  # Claude

@@ -95,6 +95,15 @@ export function installPublicTransport() {
       }
     }
 
+    // Read-only public GitHub metadata. Never forward provider keys, cookies,
+    // user headers, arbitrary paths, request bodies or redirects.
+    const githubPath = /^\/repos\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9_.-]{1,100}(?:\/(?:readme|issues))?$/;
+    const githubQuery = url.pathname.endsWith('/issues') ? url.search === '?state=open&per_page=10' : !url.search;
+    if(url.origin === 'https://api.github.com' && githubPath.test(url.pathname) && githubQuery && method === 'GET' && options.body === undefined) {
+      try {return await upstreamFetch(url,{method:'GET',headers:{accept:'application/vnd.github+json','user-agent':'BLUE-Agent'},redirect:'error',credentials:'omit',cache:'no-store',signal:AbortSignal.timeout(10000)});}
+      catch {throw new Error('Public GitHub connection unavailable.');}
+    }
+
     // Model traffic requires this chat request's own provider key.
     const key = visitorKey();
     if (!key) return fail();

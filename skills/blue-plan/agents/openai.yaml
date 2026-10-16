@@ -1,0 +1,4 @@
+interface:
+  display_name: "BLUE Plan"
+  short_description: "Plan work and verify concrete outcomes"
+  default_prompt: "Use $blue-plan to turn this goal into concrete steps and acceptance checks."

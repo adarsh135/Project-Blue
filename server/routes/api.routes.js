@@ -1,3 +1,4 @@
+import { listItems, saveItem, applyAgent, readRepository } from '../workspace.js';
 import express from 'express';
 import {
   all,
@@ -30,6 +31,17 @@ import { normalizeAttachments, publicAttachmentMeta } from '../agent/attachments
 export const apiRouter = express.Router();
 
 apiRouter.use(requireUser);
+apiRouter.get('/workspace', async (req,res)=>res.json({agents:await listItems(req.user.id,'agent'),skills:await listItems(req.user.id,'skill'),connections:await listItems(req.user.id,'connection')}));
+for(const kind of ['agent','skill','connection']) {
+ apiRouter.post(`/workspace/${kind}`,requireSameOrigin,async(req,res)=>res.status(201).json({item:await saveItem(req.user.id,kind,req.body||{})}));
+ apiRouter.put(`/workspace/${kind}/:id`,requireSameOrigin,async(req,res)=>res.json({item:await saveItem(req.user.id,kind,req.body||{},req.params.id)}));
+ apiRouter.delete(`/workspace/${kind}/:id`,requireSameOrigin,async(req,res)=>{await run('DELETE FROM workspace_items WHERE id = ? AND user_id = ? AND kind = ?',req.params.id,req.user.id,kind);res.json({ok:true});});
+}
+apiRouter.get('/workspace/connections/:id/check',async(req,res)=>{
+ const limit=await consumeRateLimit(`connection:${req.user.id}`,60000);
+ if(limit.hits>20)return res.status(429).json({error:'Too many connection checks.'});
+ try {res.json(await readRepository(req.user.id,req.params.id));} catch {res.status(502).json({error:'Repository unavailable, private, or rate-limited.'});}
+});
 
 /* ------------------------------------------------------------------ */
 /* meta                                                                */
@@ -216,7 +228,7 @@ apiRouter.post('/sessions/:id/messages', requireSameOrigin, streamGuard, async (
   const mode = ['auto', 'reasoning', 'research', 'coding', 'planning', 'writing'].includes(req.body?.mode)
     ? req.body.mode
     : settings.mode;
-  const effective = { ...settings, provider, model, mode };
+  const effective = await applyAgent(req.user.id, { ...settings, provider, model, mode }, req.body?.agent_id);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -305,11 +317,15 @@ apiRouter.post('/chat', requireSameOrigin, streamGuard, async (req, res) => {
       model,
     });
   }
+  const effective = await applyAgent(req.user.id, { ...settings, provider, model, mode }, req.body?.agent_id);
+  const controller = new AbortController();
+  res.on('close',()=>{if(!res.writableEnded) controller.abort();});
   const events = [];
   const done = await runAgent({
     user: req.user,
     session,
-    settings: { ...settings, provider, model, mode },
+    settings: effective,
+    signal: controller.signal,
     userText: content,
     attachments,
     onEvent: (event) => events.push(event),

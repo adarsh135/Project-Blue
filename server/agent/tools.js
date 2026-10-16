@@ -1,3 +1,4 @@
+import { readRepository } from '../workspace.js';
 import { config } from '../config.js';
 import {
   all,
@@ -285,6 +286,7 @@ export async function runWebSearch(query, maxResults = 5) {
 /* ------------------------------------------------------------------ */
 
 export const TOOL_DEFINITIONS = [
+ {name:'github_repository',description:'Read overview, README or open issues from a user-connected public GitHub repository. Use connection IDs listed in the system context. Read-only; no private repositories or writes.',parameters:{type:'object',properties:{connection_id:{type:'string'},section:{type:'string',enum:['overview','readme','issues']}},required:['connection_id']}},
   {
     name: 'web_search',
     description:
@@ -576,6 +578,7 @@ export async function executeTool(name, args = {}, ctx = {}) {
 
   try {
     switch (name) {
+      case 'github_repository': return await readRepository(userId,args.connection_id,args.section);
       case 'web_search': {
         try {
           const { provider, query, answer, results } = await runWebSearch(args.query, args.max_results);

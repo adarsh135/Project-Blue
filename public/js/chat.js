@@ -428,7 +428,7 @@ export async function sendTurn(text) {
     const sessionId = await ensureSession();
     await streamChat(
       sessionId,
-      { content, attachments, mode: state.settings?.mode || 'auto' },
+      { content, attachments, provider: state.settings?.provider || 'local', model: state.settings?.model, mode: state.settings?.mode || 'auto' },
       {
         signal: controller.signal,
         onEvent: (event) => {
