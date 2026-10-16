@@ -35,13 +35,10 @@ export function installPublicTransport() {
     if ((!exact && !gemini) || url.username || url.password || url.hash || options.method !== 'POST') return fail();
     const headers = new Headers(options.headers);
     const credentialMatches = gemini
-      ? url.searchParams.get('key') === key && url.searchParams.get('alt') === 'sse' && [...url.searchParams.keys()].every(k => ['key', 'alt'].includes(k))
+      ? !url.searchParams.has('key') && url.searchParams.get('alt') === 'sse' && [...url.searchParams.keys()].every(k => k === 'alt') && headers.get('x-goog-api-key') === key
       : !url.search && (url.hostname === 'api.openai.com' ? headers.get('authorization') === `Bearer ${key}` : headers.get('x-api-key') === key);
     if (!credentialMatches) return fail();
-    if (gemini) {
-      url.searchParams.delete('key');
-      headers.set('x-goog-api-key', key);
-    }
+    // Gemini credentials must already be in the header; query-string keys are rejected.
     try {
       const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000);
       const response = await upstreamFetch(url, { ...options, headers, redirect: 'error', signal });
