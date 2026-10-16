@@ -1,0 +1,41 @@
+# Caddy front door for Project Blue.
+#
+# Caddy obtains and renews a Let's Encrypt certificate for the site name
+# automatically — there is no certbot step and nothing to renew by hand.
+# It needs the domain's A/AAAA record pointing at this host and inbound
+# 80 + 443 reachable (80 for the ACME HTTP-01 challenge and the redirect).
+
+{$DOMAIN:problue.run.place} {
+	encode zstd gzip
+
+	# `flush_interval -1` disables response buffering, which matters for the
+	# SSE chat stream: /api/sessions/:id/messages must reach the browser token
+	# by token, not all at once when the response completes.
+	reverse_proxy blue:4000 {
+		flush_interval -1
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+
+	header {
+		# The app sets its own CSP and HSTS; these are belt-and-braces for
+		# anything served before the app handles it.
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
+
+# Optional: keep the app reachable on the bare hostname too, so a stale
+# bookmark or a health check that hits http://<ip>/ still resolves.
+# Uncomment and set if you want that behaviour.
+# :80 {
+# 	redir https://{$DOMAIN:problue.run.place}{uri} permanent
+# }

@@ -1,4 +1,4 @@
-import { config } from '../config.js';
+import { config, describeProviderError } from '../config.js';
 
 /**
  * Streaming model adapters.
@@ -14,6 +14,12 @@ function sseLines(buffer, chunk) {
   const combined = buffer + chunk;
   const lines = combined.split('\n');
   return { rest: lines.pop() ?? '', lines };
+}
+
+/** Read a failed response body without ever throwing, then explain it. */
+async function failWith({ providerId, model, res }) {
+  const body = await res.text().catch(() => res.statusText);
+  throw describeProviderError({ providerId, model, status: res.status, body });
 }
 
 async function* openaiStream({ apiKey, baseUrl, model, messages, tools, temperature, signal }) {
@@ -36,7 +42,7 @@ async function* openaiStream({ apiKey, baseUrl, model, messages, tools, temperat
     signal,
   });
   if (!res.ok || !res.body) {
-    throw new Error(`${res.status} ${await res.text().catch(() => res.statusText)}`.slice(0, 500));
+    await failWith({ providerId: 'openai', model, res });
   }
 
   let buffer = '';
@@ -109,7 +115,7 @@ async function* anthropicStream({ apiKey, baseUrl, model, system, messages, tool
     signal,
   });
   if (!res.ok || !res.body) {
-    throw new Error(`${res.status} ${await res.text().catch(() => res.statusText)}`.slice(0, 500));
+    await failWith({ providerId: 'anthropic', model, res });
   }
 
   let buffer = '';
@@ -164,24 +170,30 @@ async function* anthropicStream({ apiKey, baseUrl, model, system, messages, tool
 }
 
 async function* geminiStream({ apiKey, baseUrl, model, system, contents, tools, temperature, signal }) {
-  const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+  const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
   const body = {
     contents,
     systemInstruction: system ? { parts: [{ text: system }] } : undefined,
-    generationConfig: { temperature, maxOutputTokens: 4096 },
+    generationConfig: { maxOutputTokens: 4096 },
   };
+  // Google deprecated temperature/top_p/top_k for the Gemini 3.x family
+  // (2026-07-21). Sending it to a 3.x model is at best ignored, so omit it and
+  // let the model use its own default rather than risk a 400.
+  if (!isGemini3OrNewer(model)) body.generationConfig.temperature = temperature;
   if (tools?.length) {
     body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: sanitizeSchema(t.parameters) })) }];
   }
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    // The documented auth surface for the Gemini API is the x-goog-api-key
+    // header; the ?key= query parameter is legacy and leaks into logs.
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify(body),
     signal,
   });
   if (!res.ok || !res.body) {
-    throw new Error(`${res.status} ${await res.text().catch(() => res.statusText)}`.slice(0, 500));
+    await failWith({ providerId: 'gemini', model, res });
   }
 
   let buffer = '';
@@ -235,7 +247,7 @@ async function* ollamaStream({ baseUrl, model, messages, tools, temperature, sig
     signal,
   });
   if (!res.ok || !res.body) {
-    throw new Error(`${res.status} ${await res.text().catch(() => res.statusText)}`.slice(0, 500));
+    await failWith({ providerId: 'ollama', model, res });
   }
 
   let buffer = '';
@@ -273,18 +285,39 @@ async function* ollamaStream({ baseUrl, model, messages, tools, temperature, sig
   yield { type: 'end', finishReason: 'stop' };
 }
 
-/** Gemini rejects some JSON-schema keywords; keep it minimal. */
+/**
+ * The Gemini 3.x line deprecated temperature/top_p/top_k (2026-07-21).
+ * Anything 3 or later (3.8, 4, ...) should not be sent sampling parameters.
+ */
+function isGemini3OrNewer(model) {
+  const match = /^gemini-(\d+)/i.exec(String(model || ''));
+  return match ? Number(match[1]) >= 3 : false;
+}
+
+/** Gemini rejects some JSON-schema keywords; keep it minimal but valid. */
 function sanitizeSchema(schema) {
   if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
   const out = { type: 'object', properties: {} };
   for (const [key, value] of Object.entries(schema.properties || {})) {
-    const entry = { type: value.type === 'integer' ? 'number' : value.type || 'string' };
-    if (value.description) entry.description = value.description;
-    if (Array.isArray(value.enum)) entry.enum = value.enum;
-    out.properties[key] = entry;
+    const entry = sanitizeProperty(value);
+    if (entry) out.properties[key] = entry;
   }
   if (Array.isArray(schema.required)) out.required = schema.required;
   return out;
+}
+
+/**
+ * Gemini's function schema is a restricted OpenAPI subset: `integer` is not a
+ * valid scalar type (use `number`), and an `array` without `items` is rejected.
+ */
+function sanitizeProperty(value) {
+  if (!value || typeof value !== 'object') return { type: 'string' };
+  const rawType = value.type === 'integer' ? 'number' : value.type || 'string';
+  const entry = { type: rawType };
+  if (value.description) entry.description = value.description;
+  if (Array.isArray(value.enum)) entry.enum = value.enum;
+  if (rawType === 'array') entry.items = sanitizeProperty(value.items || { type: 'string' });
+  return entry;
 }
 
 /* ------------------------------------------------------------------ */

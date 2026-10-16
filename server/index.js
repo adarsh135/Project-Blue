@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import { attachUser, pruneExpiredSessions, requireSameOrigin } from './auth.js';
 import { apiRouter } from './routes/api.routes.js';
 import { authRouter } from './routes/auth.routes.js';
-import { availableProviders, config, defaultProviderId, ROOT } from './config.js';
+import { availableProviders, config, defaultProviderId, retiredModelWarning, ROOT } from './config.js';
+import { searchHealth } from './agent/tools.js';
 import { log } from './lib/util.js';
 
 // Everything is served from this origin: inline styles/scripts only from self,
@@ -39,6 +40,15 @@ app.use((req, res, next) => {
   next();
 });
 
+/** Which search backends are explicitly configured (not the keyless fallback). */
+function configuredSearchProviders() {
+  const ids = Object.entries(config.search)
+    .filter(([, v]) => v)
+    .map(([k]) => k);
+  if (config.searxngUrl) ids.push('searxng');
+  return ids;
+}
+
 const started = Date.now();
 app.use((req, res, next) => {
   res.on('finish', () => {
@@ -54,13 +64,23 @@ app.use(attachUser);
 app.use('/api/auth', requireSameOrigin, authRouter);
 
 app.get('/api/status', (req, res) => {
+  const providers = availableProviders();
+  // Flag any configured model the vendor has since retired, so a stale .env
+  // explains itself instead of surfacing as a mystery 404 mid-conversation.
+  const staleModels = providers
+    .filter((p) => p.kind === 'remote')
+    .map((p) => retiredModelWarning(p.id, p.model))
+    .filter(Boolean);
+
   res.json({
     ok: true,
     version: config.version,
     uptime_ms: Date.now() - started,
-    providers: availableProviders(),
+    providers,
     default_provider: defaultProviderId(),
-    search_configured: Object.entries(config.search).filter(([, v]) => v).map(([k]) => k),
+    search_configured: configuredSearchProviders(),
+    search: searchHealth(),
+    stale_models: staleModels,
   });
 });
 
@@ -107,7 +127,7 @@ const server = app.listen(config.port, config.host, () => {
   const providers = availableProviders();
   log('blue', `Project Blue v${config.version} listening on http://${config.host}:${config.port}`);
   log('blue', `engine: ${defaultProviderId()}  |  configured providers: ${providers.map((p) => p.id).join(', ')}`);
-  log('blue', `web search: ${Object.entries(config.search).filter(([, v]) => v).map(([k]) => k).join(', ') || 'duckduckgo (keyless)'}`);
+  log('blue', `web search: ${configuredSearchProviders().join(', ') || 'duckduckgo (keyless)'}`);
   log('blue', `data dir: ${config.dataDir}`);
 });
 

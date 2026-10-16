@@ -203,20 +203,89 @@ export function parseCookies(req) {
   return out;
 }
 
-export function cookieHeader(token, { maxAgeSeconds = config.sessionTtlHours * 3600, secure = false } = {}) {
-  const attrs = [
-    `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Lax',
-    `Max-Age=${maxAgeSeconds}`,
-  ];
+/**
+ * Does this request arrive over HTTPS? Behind a reverse proxy that is what
+ * `x-forwarded-proto` says; otherwise Express knows from the socket.
+ */
+export function isSecureRequest(req) {
+  const proto = req?.headers?.['x-forwarded-proto'];
+  if (typeof proto === 'string' && proto.split(',')[0].trim() === 'https') return true;
+  return Boolean(req?.secure);
+}
+
+/**
+ * The cookie attributes that depend on how the request arrived.
+ *
+ * One builder for every cookie writer, deliberately. The session cookie, the
+ * CSRF cookie and both clearing cookies have to agree on `Secure`/`SameSite`,
+ * and spelling them out separately is exactly how the CSRF cookie once ended
+ * up without `Secure` while the session cookie had it.
+ */
+function cookieAttrs({ sameSite = 'Lax', secure = false, partitioned = false, maxAgeSeconds } = {}) {
+  const attrs = ['Path=/', `SameSite=${sameSite}`];
+  if (maxAgeSeconds !== undefined) attrs.push(`Max-Age=${maxAgeSeconds}`);
   if (secure) attrs.push('Secure');
+  if (partitioned) attrs.push('Partitioned');
   return attrs.join('; ');
 }
 
-export const clearCookieHeader = () =>
-  [`${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`, `${CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0`];
+/**
+ * How the session and CSRF cookies should be marked for this request.
+ *
+ * `SameSite=Lax` is the stronger default and what production uses: the app is
+ * served same-origin behind Caddy, so nothing legitimate is ever cross-site.
+ *
+ * It breaks wherever the app is embedded cross-site, though — a preview iframe
+ * on another origin — because a Lax cookie is simply *not sent* on those
+ * requests. The login POST returns 200, the cookie is stored, and then every
+ * following fetch arrives unauthenticated: the app looks like it logs you in
+ * and then shows nothing at all. Embedded contexts therefore need
+ * `SameSite=None; Secure`, plus `Partitioned` (CHIPS) so the cookies keep
+ * working in browsers that block third-party cookies outright.
+ *
+ * `None` is only valid next to `Secure`, so the implicit rule also downgrades
+ * to Lax over plain HTTP rather than handing the browser a cookie it rejects —
+ * that keeps local development on a LAN address working. An explicit
+ * `BLUE_COOKIE_SAMESITE=none` is honoured as written, since asking for it means
+ * the deployment really is cross-site and really is on HTTPS.
+ */
+export function cookiePolicy(req) {
+  const secure = isSecureRequest(req);
+
+  if (config.cookieSameSite) {
+    const sameSite = config.cookieSameSite;
+    const needsSecure = sameSite === 'none';
+    return {
+      secure: secure || needsSecure,
+      sameSite: sameSite === 'none' ? 'None' : sameSite === 'strict' ? 'Strict' : 'Lax',
+      partitioned: needsSecure && config.cookiePartitioned,
+    };
+  }
+
+  // Implicit: cross-site embedding is the norm off production, HTTPS is what
+  // makes `None` legal at all.
+  const crossSite = secure && config.env !== 'production';
+  return { secure, sameSite: crossSite ? 'None' : 'Lax', partitioned: crossSite && config.cookiePartitioned };
+}
+
+export function cookieHeader(
+  token,
+  { maxAgeSeconds = config.sessionTtlHours * 3600, sameSite, secure = false, partitioned = false } = {},
+) {
+  const attrs = cookieAttrs({ sameSite, secure, partitioned, maxAgeSeconds });
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; ${attrs}`;
+}
+
+/**
+ * The CSRF cookie stays readable by JS (that is the point of double-submit) but
+ * still needs `Secure` on HTTPS: without it the token can be read off a
+ * plaintext request to the same host, which is exactly what a network attacker
+ * would need to forge a state-changing call.
+ */
+export const clearCookieHeader = ({ sameSite, secure = false, partitioned = false } = {}) => {
+  const tail = cookieAttrs({ sameSite, secure, partitioned, maxAgeSeconds: 0 });
+  return [`${SESSION_COOKIE}=; HttpOnly; ${tail}`, `${CSRF_COOKIE}=; ${tail}`];
+};
 
 export const CSRF_COOKIE = 'blue_csrf';
 
@@ -225,11 +294,14 @@ export const CSRF_COOKIE = 'blue_csrf';
  * The browser mirrors the CSRF token into an `x-blue-csrf` header, which a
  * cross-site attacker cannot read or set (it would need CORS permission).
  */
-export function sessionCookieHeaders(token, { maxAgeSeconds = config.sessionTtlHours * 3600, secure = false } = {}) {
+export function sessionCookieHeaders(
+  token,
+  { maxAgeSeconds = config.sessionTtlHours * 3600, sameSite, secure = false, partitioned = false } = {},
+) {
   const csrf = crypto.randomBytes(18).toString('base64url');
   return [
-    cookieHeader(token, { maxAgeSeconds, secure }),
-    `${CSRF_COOKIE}=${csrf}; Path=/; SameSite=Lax; Max-Age=${maxAgeSeconds}`,
+    cookieHeader(token, { maxAgeSeconds, sameSite, secure, partitioned }),
+    `${CSRF_COOKIE}=${csrf}; ${cookieAttrs({ sameSite, secure, partitioned, maxAgeSeconds })}`,
   ];
 }
 

@@ -152,8 +152,9 @@ configure instead.
 
 | tool | notes |
 | --- | --- |
-| `web_search` | Tavily → Brave → Serper → keyless DuckDuckGo (Instant Answer + HTML fallback); every attempt is recorded in `searches`, including failures (`provider: 'unavailable'`) |
-| `fetch_page` | 12s timeout, HTML→readable text, capped at 40k chars |
+| `web_search` | Tavily → Brave → Serper → SearXNG (`BLUE_SEARXNG_URL`, keyless and dependable) → keyless DuckDuckGo (Instant Answer + POST SERP lanes). A 202/anomaly anti-bot page is raised as `SearchBlockedError`, never as an empty result set; every attempt is recorded in `searches`, including failures (`provider: 'unavailable'`) |
+| `fetch_page` | 12s timeout, HTML→readable text and JSON→pretty-printed, capped at 40k chars; transport failures unwrap the `error.cause` (DNS/TLS/refused) instead of reporting "fetch failed" |
+| `search_lanes` | `BLUE_SEARCH_DDG_BASE` re-points the keyless lanes at a mirror, proxy or local server; `searchHealth()` reports the active backend, whether it is keyless, and the last outcome |
 | `calculator` | recursive-descent parser: `+ - * / % ^`, functions, constants; no `eval`; thousands separators supported |
 | `clock` | `Intl.DateTimeFormat` with a validated IANA timezone |
 | `memory` | `save` / `recall` / `forget` against the `memories` table |
@@ -162,6 +163,22 @@ configure instead.
 
 Tools are per-account toggles (`settings.tools_enabled`) and are filtered before being sent
 to the model, so a disabled tool simply doesn't exist for that turn.
+
+### Routing a message to a tool (offline engine)
+
+`detectIntent()` in `local-engine.js` is an ordered classifier; a message pasted with a URL
+is matched **before** the web-search rule, so a link is read rather than searched around.
+`extractUrl()` accepts `https://…` and bare hosts, but only when the TLD is a real one — so
+`node.js`, `1.5` and `someone@internal.test` are not mistaken for somewhere to fetch.
+Every tool the table above lists is reachable this way, including `fetch_page`.
+
+### Provider compatibility
+
+`RETIRED_MODELS` in `config.js` is an append-only registry of model IDs vendors have shut
+down. `describeProviderError()` turns the vendor's opaque 404/401/429 into a message naming
+the replacement, and `/api/status` surfaces stale IDs under `stale_models`. Gemini uses the
+`x-goog-api-key` header and skips the deprecated `temperature`/`top_p`/`top_k` on 3.x+;
+`sanitizeSchema()` maps `integer`→`number` and keeps `items` on arrays.
 
 ---
 

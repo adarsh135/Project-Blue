@@ -8,7 +8,7 @@ process.env.BLUE_LOCAL_TOKEN_DELAY_MS = '0';
 process.env.BLUE_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'blue-engine-test-'));
 process.env.BLUE_SEARCH_OFFLINE = 'true';
 
-const { detectIntent, runLocalEngine } = await import('../server/agent/local-engine.js');
+const { detectIntent, extractUrl, runLocalEngine } = await import('../server/agent/local-engine.js');
 
 const collect = async (messages, { tools = [], context = { userId: 'u_test' } } = {}) => {
   const events = [];
@@ -124,6 +124,92 @@ test('engine: respects disabled tools', async () => {
   const { text, toolCalls } = await collect([{ role: 'user', content: 'search the web for anything' }], { tools: [] });
   assert.equal(toolCalls.length, 0);
   assert.match(text, /disabled/i);
+});
+
+test('intent: a pasted URL routes to fetch_page, not a search or the generic reply', () => {
+  assert.equal(detectIntent('fetch https://api.github.com/repos/nodejs/node').kind, 'fetch_page');
+  assert.equal(detectIntent('https://example.com').kind, 'fetch_page');
+  assert.equal(detectIntent('read https://nodejs.org/en/blog and summarise it').kind, 'fetch_page');
+  assert.equal(detectIntent('open example.com and summarize').kind, 'fetch_page');
+  assert.equal(detectIntent('summarize this page https://api.github.com/repos/nodejs/node').kind, 'fetch_page');
+  assert.deepEqual(detectIntent('read https://nodejs.org/en/blog').url, 'https://nodejs.org/en/blog');
+});
+
+test('intent: a URL is only extracted when it really is one', () => {
+  // Bare hosts resolve to a fetch…
+  assert.equal(extractUrl('open example.com/docs'), 'example.com/docs');
+  // …but dotted identifiers and unknown TLDs must not be mistaken for hosts.
+  assert.equal(detectIntent('explain how node.js handles the event loop').kind, 'general');
+  assert.equal(extractUrl('explain how node.js handles the event loop'), '');
+  // ".test" is not a public TLD, so an address is a fact to store, not a page.
+  assert.equal(extractUrl('my email is someone@internal.test'), '');
+  assert.notEqual(detectIntent('my email is someone@internal.test').kind, 'fetch_page');
+  assert.equal(extractUrl('calc 1.5 * 4'), '');
+});
+
+test('intent: an explicit "search the web" still wins over an incidental URL', () => {
+  assert.equal(detectIntent('search the web for node lts release notes').kind, 'web_search');
+});
+
+test('engine: fetch_page intent asks the tool layer for the page', async () => {
+  const { toolCalls, text } = await collect([{ role: 'user', content: 'read https://nodejs.org/en/blog and summarise it' }], {
+    tools: [{ name: 'fetch_page' }],
+  });
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0].name, 'fetch_page');
+  assert.equal(JSON.parse(toolCalls[0].args).url, 'https://nodejs.org/en/blog');
+  assert.match(text, /Fetching/);
+});
+
+test('engine: renders fetched page text instead of the offline fallback', async () => {
+  const messages = [
+    { role: 'user', content: 'read https://nodejs.org/en/blog' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'f1', name: 'fetch_page', args: {} }] },
+    {
+      role: 'tool',
+      name: 'fetch_page',
+      tool_call_id: 'f1',
+      content: JSON.stringify({
+        __tool: 'fetch_page',
+        ok: true,
+        url: 'https://nodejs.org/en/blog',
+        title: 'Node.js Blog',
+        text: 'Node 24 is the current LTS release line.',
+      }),
+    },
+  ];
+  const { text } = await collect(messages);
+  assert.match(text, /Node\.js Blog/);
+  assert.match(text, /Node 24 is the current LTS release line\./);
+  assert.ok(!/offline `blue-local-1` planner/.test(text), 'must not fall back to the generic reply');
+});
+
+test('engine: says so when fetch_page is switched off', async () => {
+  const { text, toolCalls } = await collect([{ role: 'user', content: 'read https://example.com' }], { tools: [] });
+  assert.equal(toolCalls.length, 0);
+  assert.match(text, /switched off/i);
+  assert.match(text, /fetch_page/);
+});
+
+test('engine: explains a blocked search differently from an empty one', async () => {
+  const blocked = [
+    { role: 'user', content: 'search the web for node lts' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'b', name: 'web_search', args: {} }] },
+    {
+      role: 'tool',
+      name: 'web_search',
+      tool_call_id: 'b',
+      content: JSON.stringify({
+        __tool: 'web_search',
+        ok: false,
+        blocked: true,
+        error: 'DuckDuckGo served an anti-bot challenge instead of results.',
+      }),
+    },
+  ];
+  const { text } = await collect(blocked);
+  assert.match(text, /refusing this server/i);
+  assert.match(text, /not your query/i);
 });
 
 test('engine: memory write path stores under a sensible key', async () => {

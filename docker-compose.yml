@@ -1,0 +1,100 @@
+# Project Blue — single-host production deployment.
+#
+#   1. cp .env.deploy.example .env    (and fill it in)
+#   2. docker compose up -d --build
+#
+# Caddy terminates TLS and gets a Let's Encrypt certificate for DOMAIN
+# automatically, once that name's DNS points at this machine and ports 80/443
+# are reachable.
+
+services:
+  blue:
+    build: .
+    image: project-blue:latest
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      BLUE_DATA_DIR: /data
+      # Required: sessions are signed with this. Generate with `openssl rand -base64 48`.
+      BLUE_SESSION_SECRET: ${BLUE_SESSION_SECRET:?set BLUE_SESSION_SECRET in .env}
+      # Used for CSRF origin checks and for building absolute links.
+      PUBLIC_URL: https://${DOMAIN:-problue.run.place}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+      # ---- optional: model provider (omit all for the built-in offline engine)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      # ---- search backend. Defaults to the bundled searxng service below,
+      # which is keyless and does not get throttled the way a datacenter IP
+      # scraping duckduckgo.com does. Set BLUE_SEARXNG_URL in .env to point at
+      # an external instance, or to an empty value to drop this lane and use
+      # the keyless DuckDuckGo scrape instead. A configured-but-unreachable
+      # instance falls back to that scrape rather than failing the search.
+      # `-` not `:-`: an explicitly empty BLUE_SEARXNG_URL in .env must be able
+      # to switch this lane off, while leaving it unset gets the bundled one.
+      BLUE_SEARXNG_URL: ${BLUE_SEARXNG_URL-http://searxng:8080}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+    volumes:
+      # blue.db + .session-secret — everything that must survive a redeploy.
+      - blue-data:/data
+    expose:
+      - "4000"
+    # Ordered after SearXNG so the search lane is usually up by the time the
+    # first chat runs. This waits for *start*, not readiness: if the instance is
+    # still booting, runWebSearch falls back to the keyless scrape instead of
+    # failing, so a slow start never costs the user a reply.
+    depends_on:
+      searxng:
+        condition: service_started
+
+  # Keyless search lane. Deliberately publishes no ports: the only thing that
+  # can reach it is Blue, over the compose network, by the name `searxng`.
+  searxng:
+    image: searxng/searxng:${SEARXNG_VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      # Signs its own session cookies. Generate with `openssl rand -hex 32`.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080/}
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PUBLIC_INSTANCE: "false"
+    volumes:
+      # `json` is enabled for Blue in this file; see searxng/settings.yml.
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:-problue.run.place}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      blue:
+        condition: service_healthy
+
+volumes:
+  blue-data:
+  searxng-cache:
+  caddy-data:
+  caddy-config:

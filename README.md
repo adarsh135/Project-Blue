@@ -4,7 +4,7 @@
 
 Blue is what you get when you take the assistant experience you're used to (plan → use tools → cite sources → remember you) and build it as plain, inspectable Node.js you own: one process, one SQLite file, zero required API keys.
 
-![status](https://img.shields.io/badge/tests-44%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+![status](https://img.shields.io/badge/tests-81%20passing-brightgreen) ![node](https://img.shields.io/badge/node-%E2%89%A522.5-blue) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
@@ -62,6 +62,7 @@ Blue picks the provider automatically; per-account you can switch provider, mode
 | `what time is it in Asia/Kolkata?` | `clock` tool, real IANA timezone maths |
 | `calc (1250 * 1.18) / 3` | `calculator` tool — exact, no hallucinated arithmetic |
 | `search the web for the latest Node.js LTS release` | `web_search` → cited markdown links, logged in Recent searches |
+| `read https://api.github.com/repos/nodejs/node` | `fetch_page` — the readable text of that URL, pretty-printed for APIs |
 | `show my recent searches` | `search_history` tool renders your own search log |
 | `find in my chats about sqlite` | `session_search` across every message you've ever sent |
 | `who are you?` | Blue explains its own credential/session/memory architecture |
@@ -167,10 +168,125 @@ curl -X POST localhost:4000/api/chat \
 
 ---
 
+## Web search
+
+`web_search` picks the first configured backend:
+
+```
+Tavily → Brave → Serper → SearXNG → keyless DuckDuckGo
+```
+
+The first three need a key. **SearXNG is the keyless option that actually holds up** — search
+no longer depends on somebody else's throttling policy. It aggregates whatever engines its
+instance is configured with, and there is no per-IP anti-bot campaign aimed at a private
+instance.
+
+`docker-compose.yml` runs one next to Blue and points the app at it, so the hosted path needs
+no configuration. To run it by hand:
+
+```bash
+docker run -d --name searxng -p 8080:8080 searxng/searxng
+# then, in .env:
+BLUE_SEARXNG_URL=http://localhost:8080
+```
+
+The instance needs `json` in its `search.formats` setting — the image defaults to `html` only.
+`searxng/settings.yml` enables it for the bundled service; a hand-rolled `docker run` like the
+one above will answer with HTML, and Blue detects that and says exactly which setting to change
+rather than failing vaguely.
+
+Two failure modes are deliberately treated differently:
+
+* **Unreachable** (still booting, container died) — Blue falls back to the keyless scrape for
+  that search and reports `duckduckgo` as the provider that actually answered, so a degradation
+  is never mistaken for the configured backend having worked.
+* **Misconfigured** — no silent fallback. The error names the setting, because that is a bug to
+  fix, not one to route around.
+
+Only with none of the above does `web_search` fall back to DuckDuckGo's keyless endpoints: the
+Instant Answer API for entity/definition facts, then the `html.duckduckgo.com` and
+`lite.duckduckgo.com` SERP lanes over **POST** with a `Referer` (DuckDuckGo tolerates this far
+longer than a GET) and a minimum spacing between requests.
+
+Be aware of what keyless means in practice: DuckDuckGo rate-limits per IP and, once a machine
+is flagged, answers with an **anti-bot challenge page served as HTTP 202**. `fetch` treats 202
+as success, so a naive scraper reads that as "0 results" and tells you your query matched
+nothing. Blue detects the challenge (status, `anomaly.js`, the modal markup) and says so:
+
+```
+⚠️ web_search failed
+DuckDuckGo served an anti-bot challenge instead of results (HTTP 202).
+This is an IP-reputation block on the machine running Blue, not a problem with your query.
+```
+
+`GET /api/status` reports the active backend and the last outcome, so you can tell a block
+from an empty result set without reading logs:
+
+```json
+"search": { "provider": "duckduckgo", "keyless": true,
+            "last": { "results": 0, "blocked": true, "error": null } }
+```
+
+If you see `blocked: true` more than occasionally, move off the scrape lane: set
+`BLUE_SEARXNG_URL` at your own instance, or one of `TAVILY_API_KEY`, `BRAVE_API_KEY`,
+`SERPER_API_KEY`. The failed attempt is still recorded in Recent searches with
+`provider: 'unavailable'`, so your history stays honest about what happened.
+
+---
+
+## Model lifecycle
+
+Vendors retire model IDs on their own schedule, and a stale `.env` otherwise shows up as a
+mystery 404 in the middle of a conversation. Blue ships current defaults, recognises retired
+IDs, and turns the vendor's error into one that names the replacement:
+
+| Provider | Default | Retired IDs it will catch |
+| --- | --- | --- |
+| OpenAI-compatible | `gpt-5.6-terra` | `gpt-4o-mini`, `gpt-4o` (flagged as deprecated) |
+| Anthropic | `claude-sonnet-5` | the whole Claude 3/3.5/3.7 line, Opus 4.1 |
+| Google Gemini | `gemini-3.8-flash` | every Gemini 1.x and 2.0 model |
+| Ollama | `llama3.1` | — (local tags, no vendor lifecycle) |
+
+```
+gemini request failed (HTTP 404). model "gemini-1.5-flash" was retired by the provider on
+2025-09-29. Update your .env to gemini-3.8-flash.
+```
+
+`GET /api/status` also lists anything stale under `stale_models`. A test asserts that no
+shipped default is a model a vendor has already retired, and that every replacement named in
+the registry is itself still current.
+
+Two provider-specific notes: Gemini authenticates with the documented `x-goog-api-key` header
+rather than the legacy `?key=` query parameter, and sampling parameters (`temperature`,
+`top_p`, `top_k`) are omitted for Gemini 3.x and later, where Google deprecated them.
+
+---
+
+## Deployment
+
+One command on any host with a public IP — Docker Compose plus Caddy, which
+obtains and renews the TLS certificate for your domain automatically:
+
+```bash
+cp .env.deploy.example .env      # set BLUE_SESSION_SECRET, DOMAIN, ACME_EMAIL
+docker compose up -d --build
+```
+
+Then point an **A record** at the host's public IP. Full walkthrough, including
+a systemd-only path and the DNS steps, is in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+Two things that catch people out, both covered there: a DNS record says which
+IP serves the name and nothing more — something has to be listening on that IP
+first — and the reverse proxy must not buffer responses, because chat answers
+stream over SSE and will otherwise arrive in one lump at the end.
+
+---
+
 ## Security notes
 
 * **Passwords** — scrypt (`N=32768, r=8, p=1`, 64-byte key, per-user random salt). Login failures are indistinguishable between "unknown email" and "wrong password".
-* **Sessions** — random 256-bit token, only its SHA-256 stored. HttpOnly + SameSite=Lax cookie with a separate readable CSRF cookie; state-changing requests must present the matching `x-blue-csrf` header or a same-origin `Origin`/`Referer`.
+* **Sessions** — random 256-bit token, only its SHA-256 stored. HttpOnly cookie with a separate readable CSRF cookie; state-changing requests must present the matching `x-blue-csrf` header or a same-origin `Origin`/`Referer`.
+* **Cookie scope** — `SameSite=Lax; Secure` in production, which is the stronger setting and correct because the app is served same-origin. Off production it relaxes to `SameSite=None; Secure; Partitioned` over HTTPS, because a hosted preview embeds the app cross-site in an iframe and a `Lax` cookie is **not sent** on those requests — the effect being a login that returns 200 and then an app that shows nothing. Override with `BLUE_COOKIE_SAMESITE` (`lax` / `strict` / `none`).
 * **API keys** — `blue_sk_<prefix>_<secret>`; only the SHA-256 of the secret is stored, the plaintext is shown exactly once, comparison is timing-safe, and keys can be revoked per key.
 * **Rate limiting** — login/register limits per IP, per-user message throughput cap.
 * **Isolation** — every query is scoped by `user_id`; a foreign chat id returns 404, never data.
@@ -194,14 +310,19 @@ Deployment checklist: set `BLUE_SESSION_SECRET`, run behind TLS (`PUBLIC_URL=htt
 | `BLUE_SEARCH_OFFLINE` | `false` | never make outbound search requests |
 | `BLUE_LOCAL_TOKEN_DELAY_MS` | `12` | offline-engine stream pacing |
 | `OPENAI_*`, `ANTHROPIC_*`, `GEMINI_*`, `OLLAMA_*` | – | model providers |
-| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | search providers (keyless DuckDuckGo otherwise) |
+| `TAVILY_API_KEY`, `BRAVE_API_KEY`, `SERPER_API_KEY` | – | commercial search providers (see *Web search* below) |
+| `BLUE_SEARXNG_URL` | `http://searxng:8080` in Compose | self-hosted SearXNG — keyless and dependable; empty drops the lane |
+| `BLUE_COOKIE_SAMESITE` | *auto* | `Lax` normally, `None` off production over HTTPS so the app works embedded cross-site (see *Cookies* below) |
+| `BLUE_COOKIE_PARTITIONED` | `true` | add CHIPS `Partitioned` alongside `SameSite=None` |
+| `BLUE_SEARCH_MIN_INTERVAL_MS` | `3000` | spacing between keyless DuckDuckGo requests |
+| `BLUE_SEARCH_DDG_BASE` | – | send keyless lanes to a mirror/proxy instead of duckduckgo.com |
 
 ---
 
 ## Tests
 
 ```bash
-npm test        # 44 tests, ~8s, no network required
+npm test        # 81 tests, ~8s, no network required
 ```
 
 * `tests/math.test.js` — the calculator, including rejected code-execution attempts
@@ -210,6 +331,8 @@ npm test        # 44 tests, ~8s, no network required
 * `tests/api.test.js` — boots the real server on a random port: registration validation, identical login failures, CSRF blocking, API-key auth, per-user isolation, search recording/pinning, session revocation, password change
 * `tests/ui.test.js` — loads `index.html` into jsdom against the live server and drives the real modules: register → shell renders → send → streamed answer → tool card → history reload → theme toggle
 * `tests/frontend-contract.test.js` — every DOM id the JS uses exists, every view has a section, CSP-safe HTML
+* `tests/compatibility.test.js` — no default model is one a vendor has retired, retired-ID errors name their replacement, and a DuckDuckGo anti-bot challenge is reported as a block rather than as "no results"
+* `tests/search-live.test.js` — the search lanes against a **real HTTP server on a real socket**: a real 202 is detected, the POST body and `Referer` really arrive, lane fallback works, a SearXNG instance is consumed as JSON and explained when it is not, and an unreachable one degrades to the keyless lane while a misconfigured one refuses to
 
 ---
 
@@ -239,7 +362,12 @@ public/
   js/markdown.js      XSS-safe markdown renderer
   js/ui.js            DOM helpers, toasts, modals
   js/store.js         client state + event bus
-tests/                44 tests
+tests/                81 tests
+Dockerfile            production image (Node 22, non-root, healthcheck)
+docker-compose.yml    Blue + SearXNG + Caddy; database on a named volume
+searxng/settings.yml  instance config — enables the JSON API Blue calls
+Caddyfile             automatic HTTPS, SSE-aware proxy config
+DEPLOYMENT.md         domain, TLS and backup walkthrough
 docs/ARCHITECTURE.md  data model, flows, SSE protocol
 ```
 
@@ -252,7 +380,7 @@ docs/ARCHITECTURE.md  data model, flows, SSE protocol
 - [ ] Multi-user spaces, sharing and read-only links
 - [ ] Background jobs (scheduled searches, digests)
 - [ ] Postgres adapter for horizontal scale
-- [ ] Docker image
+- [x] Docker image (`Dockerfile` + `docker-compose.yml` + `Caddyfile`, see [DEPLOYMENT.md](DEPLOYMENT.md))
 
 ## License
 

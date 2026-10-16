@@ -36,6 +36,25 @@ const NEWSY = /\b(latest|current|today'?s?|recent|now|this week|2024|2025|2026)\
 const QUESTION_START = /^(who|what|which|where|when|how much|how many)\s+(is|are|was|were|does|did|do)\b/i;
 const PRICEY = /\b(price|prices|cost|stock|net worth|release date|weather|score|population)\b/i;
 
+// ---- page fetching -------------------------------------------------
+// A URL is the clearest signal a user can give: they want *that* page read,
+// not a search around it. Recognise both full URLs and bare hosts, but only
+// treat a bare host as a URL when the TLD is a real one — otherwise "node.js"
+// or "me@blue.test" would be mistaken for somewhere to fetch.
+const TLD = 'com|org|net|io|dev|ai|co|edu|gov|info|biz|app|xyz|me|us|uk|in|de|fr|jp|au|ca|sh|so|to|gg|tv|news|blog|site|online|store|tech|cloud|works|wiki';
+const SCHEME_URL = /\bhttps?:\/\/[^\s<>"'`)\]]+/i;
+const BARE_URL = new RegExp(`\\b(?:www\\.)?[a-z0-9][a-z0-9-]*(?:\\.[a-z0-9-]+)*\\.(?:${TLD})(?:\\/[^\\s<>"'\`)\\]]*)?`, 'i');
+const FETCH_VERBS = /\b(fetch|open|read|load|visit|pull up|grab|scrape|summari[sz]e|summarise|digest|extract|review|check out|look at|what does)\b/i;
+
+/** Pull the first URL out of a message, scheme'd or bare. */
+export function extractUrl(text) {
+  const trimmed = String(text || '');
+  const match = SCHEME_URL.exec(trimmed) || BARE_URL.exec(trimmed);
+  if (!match) return '';
+  // Trailing sentence punctuation is not part of the URL.
+  return match[0].replace(/[.,;:!?]+$/, '');
+}
+
 export function detectIntent(text) {
   const raw = String(text || '').trim();
   const t = lower(raw);
@@ -79,6 +98,13 @@ export function detectIntent(text) {
   // calculator
   const calcMatch = /^(?:what(?:'s| is)\s+)?(?:calc(?:ulate)?\s*:?\s*)?(.+)$/i.exec(raw);
   if (calcMatch && looksLikeMath(calcMatch[1])) return { kind: 'calculator', expression: cleanExpression(calcMatch[1]) };
+
+  // page fetch — a pasted URL beats a search unless the user explicitly asked
+  // to search and gave no "read this" verb.
+  const url = extractUrl(raw);
+  if (url && !(SEARCH_VERBS.test(raw) && !FETCH_VERBS.test(raw))) {
+    return { kind: 'fetch_page', url };
+  }
 
   // web search
   const explicit = SEARCH_VERBS.test(raw) || SEARCH_TARGET.test(raw) && /\b(search|look up|find)\b/i.test(raw);
@@ -230,6 +256,7 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
           '',
           '**How to drive me**',
           '- "search for the latest React 19 changes"',
+          '- "read https://nodejs.org/en/blog and summarise it"',
           '- "remember my timezone is Asia/Kolkata"',
           '- "what did we discuss about SQLite?"',
           '- "show my recent searches"',
@@ -309,6 +336,19 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
       return;
     }
 
+    case 'fetch_page': {
+      if (!toolNames.has('fetch_page')) {
+        yield* streamText(
+          `Reading pages is switched off in your settings, so I can't open ${intent.url}. Enable \`fetch_page\` in Settings → Tools.`,
+        );
+        yield { type: 'end', finishReason: 'stop' };
+        return;
+      }
+      yield* emitTool('fetch_page', { url: intent.url, max_chars: 6000 }, `_Fetching ${intent.url}…_`);
+      yield { type: 'end', finishReason: 'tool_calls' };
+      return;
+    }
+
     case 'web_search': {
       if (!toolNames.has('web_search')) {
         yield* streamText(`Web search is disabled in your settings, so I can't look up "${intent.query}". Enable \`web_search\` in Settings → Tools.`);
@@ -339,9 +379,13 @@ function synthesize(toolMessages, toolNames) {
       continue;
     }
     if (payload.ok === false) {
+      const unreachable = /Could not reach|Timed out fetching/i.test(payload.error || '');
       const hints = {
-        web_search:
-          'No search provider answered. Keyless DuckDuckGo works from most networks; for anything stricter add `TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY` to `.env` and restart the server.',
+        web_search: payload.blocked
+          ? 'DuckDuckGo is refusing this server, not your query — keyless search is rate-limited per IP. Add `TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY` to `.env` and restart the server for dependable search.'
+          : unreachable
+            ? 'The search endpoint could not be reached from this server at all, so this is a network/egress problem (DNS, TLS or firewall), not a bad query. A search API key on an allow-listed host sidesteps it.'
+            : 'No search provider answered. Keyless DuckDuckGo works from most networks; for anything stricter add `TAVILY_API_KEY`, `BRAVE_API_KEY` or `SERPER_API_KEY` to `.env` and restart the server.',
         fetch_page: 'Check the URL is public and reachable from the server running Blue.',
         memory: 'That memory action failed — the key is probably missing.',
         session_search: 'That history lookup failed.',
@@ -452,7 +496,7 @@ function generalAnswer(text, context, toolNames) {
   parts.push('**What I can do with this right now**');
   const suggestions = [];
   if (toolNames.has('web_search')) suggestions.push(`- \`web_search\` — say _"search for ${truncate(topic, 60)}"_ and I'll return live, cited results.`);
-  if (toolNames.has('fetch_page')) suggestions.push('- `fetch_page` — give me a URL and I\'ll pull the readable text out of it.');
+  if (toolNames.has('fetch_page')) suggestions.push('- `fetch_page` — paste any link (say _\"read https://… \"_) and I\'ll pull the readable text out of it.');
   if (toolNames.has('calculator')) suggestions.push('- `calculator` — send me the numbers and I\'ll compute them exactly.');
   if (toolNames.has('memory')) suggestions.push('- `memory` — _"remember that …"_ and I\'ll keep it with your account for later chats.');
   if (toolNames.has('session_search')) suggestions.push('- `session_search` — I can dig this up if we discussed it in an earlier chat.');
