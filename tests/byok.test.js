@@ -43,11 +43,27 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
     const calls = [];
     let fail = false;
     const rawFetch = async (url, options) => {
-      calls.push({ url: String(url), options });
+      const target = String(url);
+      calls.push({ url: target, options });
+      if (!fail && target.startsWith('https://api.duckduckgo.com/')) {
+        const topics = [1, 2, 3, 4].map(n => ({ FirstURL: 'https://example.com/' + n, Text: 'Fake search result ' + n }));
+        return new Response(JSON.stringify({
+          Heading: 'Fake answer',
+          AbstractText: 'Mocked search data only',
+          AbstractURL: 'https://example.com/overview',
+          RelatedTopics: topics,
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (!fail && (target === 'https://html.duckduckgo.com/html/' || target === 'https://lite.duckduckgo.com/lite/')) {
+        return new Response('<div class="result__body"><a class="result__a" href="https://example.com/page">Example</a><a class="result__snippet">Mocked page snippet</a></div>', {
+          status: 200, headers: { 'content-type': 'text/html' },
+        });
+      }
       return new Response(fail ? 'fake-secret-that-must-not-escape' : 'data: [DONE]\\n\\n', { status: fail ? 401 : 200 });
     };
     globalThis.fetch = rawFetch;
     process.env.BLUE_PUBLIC_BYOK = 'true';
+    process.env.BLUE_SEARCH_OFFLINE = 'false';
     process.env.BLUE_SESSION_SECRET = 'fake-session-secret-for-tests-only-1234';
     process.env.DATABASE_URL = 'postgresql://fake:fake@fake.neon.tech/fake';
     process.env.OPENAI_API_KEY = 'owner-key-must-never-be-used';
@@ -61,7 +77,7 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
     assert.equal(config.providers.openai.apiKey, '');
     assert.equal(config.providers.openai.baseUrl, 'https://api.openai.com/v1');
     assert.equal(config.search.tavily, '');
-    assert.equal(config.searchOffline, true);
+    assert.equal(config.searchOffline, false);
     assert.equal(config.providers.openai.defaultModel, 'gpt-6.1-sol');
     assert.equal(config.providers.anthropic.defaultModel, 'claude-sonnet-5');
     assert.equal(config.providers.gemini.defaultModel, 'gemini-3.8-flash');
@@ -104,6 +120,30 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
       const openaiBody = JSON.parse(calls[3].options.body);
       assert.equal(openaiBody.model, 'gpt-6.1-sol');
       assert.equal(openaiBody.temperature, undefined);
+
+      // Search is available without a model key, but only via fixed DDG URLs.
+      const { runWebSearch } = await import('./server/agent/tools.js');
+      const search = await credentialContext.run({ key: '' }, () => runWebSearch('mock release notes'));
+      assert.equal(search.provider, 'duckduckgo');
+      assert.equal(search.results.length, 5);
+      assert.equal(calls[4].url.startsWith('https://api.duckduckgo.com/?'), true);
+      assert.equal(calls[4].options.redirect, 'error');
+
+      await fetch('https://html.duckduckgo.com/html/', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: 'must-not-be-forwarded' },
+        body: new URLSearchParams({ q: 'fixed safe query', kl: 'wt-wt' }).toString(),
+      });
+      assert.equal(calls[5].url, 'https://html.duckduckgo.com/html/');
+      assert.equal(calls[5].options.redirect, 'error');
+      assert.equal(calls[5].options.headers.has('authorization'), false);
+      await assert.rejects(fetch('https://html.duckduckgo.com/html/?url=https%3A%2F%2F127.0.0.1%2F', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ q: 'fixed safe query', kl: 'wt-wt' }).toString(),
+      }));
+      await assert.rejects(fetch('https://api.duckduckgo.com/?q=safe&format=json&no_html=1&url=https%3A%2F%2F127.0.0.1%2F', { method: 'GET' }));
+      assert.equal(calls.length, 6);
 
       fail = true;
       await assert.rejects(fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer visitor-fake' } }), error => !error.message.includes('fake-secret') && !error.message.includes('visitor-fake'));
