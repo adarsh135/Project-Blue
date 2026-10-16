@@ -54,6 +54,7 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
     process.env.OPENAI_BASE_URL = 'http://127.0.0.1:1234';
     process.env.TAVILY_API_KEY = 'owner-search-must-never-be-used';
     const { config, availableProviders } = await import('./server/config.js');
+    const { streamModel } = await import('./server/agent/providers.js');
     const { credentialContext } = await import('./server/lib/byok.js');
     const { neonConfig } = await import('@neondatabase/serverless');
     assert.equal(neonConfig.fetchFunction, rawFetch);
@@ -80,6 +81,30 @@ test('public transport: no owner fallback, SSRF denied, Gemini key moved to head
       await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse', { method: 'POST', headers: { 'x-goog-api-key': 'visitor-fake' } });
       assert.ok(!calls[1].url.includes('visitor-fake'));
       assert.equal(calls[1].options.headers.get('x-goog-api-key'), 'visitor-fake');
+
+      // Exercise the real adapters with fake-only credentials and a mocked fetch.
+      for await (const _ of streamModel({
+        providerId: 'gemini',
+        model: 'gemini-3.8-flash',
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [],
+        temperature: 0.9,
+      })) {}
+      assert.equal(calls[2].url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse');
+      assert.equal(calls[2].options.headers.get('x-goog-api-key'), 'visitor-fake');
+      assert.equal(JSON.parse(calls[2].options.body).generationConfig.temperature, undefined);
+
+      for await (const _ of streamModel({
+        providerId: 'openai',
+        model: 'gpt-6.1-sol',
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [],
+        temperature: 0.9,
+      })) {}
+      const openaiBody = JSON.parse(calls[3].options.body);
+      assert.equal(openaiBody.model, 'gpt-6.1-sol');
+      assert.equal(openaiBody.temperature, undefined);
+
       fail = true;
       await assert.rejects(fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer visitor-fake' } }), error => !error.message.includes('fake-secret') && !error.message.includes('visitor-fake'));
     });
