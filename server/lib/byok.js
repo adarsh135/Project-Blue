@@ -24,15 +24,82 @@ export function validateVisitorKey(value) {
 export function installPublicTransport() {
   neonConfig.fetchFunction = upstreamFetch;
   globalThis.fetch = async (input, options = {}) => {
-    const key = visitorKey();
     const fail = () => { throw new Error('Provider request failed. Check your key, model, quota and provider availability.'); };
-    if (!key) return fail();
     let url;
     try { url = new URL(String(input)); } catch { return fail(); }
+    if (url.username || url.password || url.hash) return fail();
+
+    // Narrow, credential-free public web-search egress. These exact DuckDuckGo
+    // endpoints support the assistant's search and deep-research tools. Nothing
+    // can supply a destination URL, follow a redirect, or use an arbitrary host.
+    const method = String(options.method || 'GET').toUpperCase();
+    const isDdgInstant = url.origin === 'https://api.duckduckgo.com' && url.pathname === '/';
+    const isDdgHtml = (
+      url.origin === 'https://html.duckduckgo.com' && url.pathname === '/html/' ||
+      url.origin === 'https://lite.duckduckgo.com' && url.pathname === '/lite/'
+    );
+    const ddgHeaders = new Headers(options.headers);
+    const queryKeys = [...url.searchParams.keys()];
+    const safeInstant = isDdgInstant &&
+      method === 'GET' &&
+      queryKeys.length === 3 &&
+      queryKeys.every(k => ['q', 'format', 'no_html'].includes(k)) &&
+      url.searchParams.getAll('q').length === 1 &&
+      url.searchParams.get('q').trim().length > 0 &&
+      url.searchParams.get('q').length <= 500 &&
+      url.searchParams.get('format') === 'json' &&
+      url.searchParams.get('no_html') === '1';
+    let safeHtml = false;
+    if (isDdgHtml && method === 'POST' && !url.search && typeof options.body === 'string') {
+      try {
+        const body = new URLSearchParams(options.body);
+        const keys = [...body.keys()];
+        safeHtml = keys.length === 2 &&
+          keys.every(k => ['q', 'kl'].includes(k)) &&
+          body.getAll('q').length === 1 &&
+          body.get('q').trim().length > 0 &&
+          body.get('q').length <= 500 &&
+          body.getAll('kl').length === 1 &&
+          body.get('kl') === 'wt-wt' &&
+          (ddgHeaders.get('content-type') || '').toLowerCase().startsWith('application/x-www-form-urlencoded');
+      } catch { safeHtml = false; }
+    }
+    if (safeInstant || safeHtml) {
+      // Rebuild headers from a tiny allowlist; never forward caller cookies or
+      // authorization-like values to a search endpoint.
+      const headers = new Headers();
+      for (const name of ['accept', 'accept-language', 'user-agent']) {
+        const value = ddgHeaders.get(name);
+        if (value) headers.set(name, value);
+      }
+      if (safeHtml) {
+        headers.set('content-type', 'application/x-www-form-urlencoded');
+        headers.set('referer', `https://${url.hostname}/`);
+      }
+      try {
+        const signal = options.signal
+          ? AbortSignal.any([options.signal, AbortSignal.timeout(12_000)])
+          : AbortSignal.timeout(12_000);
+        return await upstreamFetch(url, {
+          ...options,
+          headers,
+          redirect: 'error',
+          credentials: 'omit',
+          cache: 'no-store',
+          signal,
+        });
+      } catch {
+        throw new Error('Public web search failed. Retry, or configure a trusted search provider in a self-hosted installation.');
+      }
+    }
+
+    // Model traffic requires this chat request's own provider key.
+    const key = visitorKey();
+    if (!key) return fail();
     const gemini = url.origin === 'https://generativelanguage.googleapis.com' &&
-      /^\/v1beta\/models\/[A-Za-z0-9._-]+:streamGenerateContent$/.test(url.pathname);
+      /^\\/v1beta\\/models\\/[A-Za-z0-9._-]+:streamGenerateContent$/.test(url.pathname);
     const exact = endpoints.has(`${url.origin}${url.pathname}`);
-    if ((!exact && !gemini) || url.username || url.password || url.hash || options.method !== 'POST') return fail();
+    if ((!exact && !gemini) || method !== 'POST') return fail();
     const headers = new Headers(options.headers);
     const credentialMatches = gemini
       ? !url.searchParams.has('key') && url.searchParams.get('alt') === 'sse' && [...url.searchParams.keys()].every(k => k === 'alt') && headers.get('x-goog-api-key') === key
