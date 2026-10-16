@@ -9,6 +9,10 @@ import { spawnSync } from 'node:child_process';
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blue-vercel-test-'));
 process.env.NODE_ENV = 'development';
 process.env.VERCEL = '1';
+// This test probes the local listener with outbound fetch(). Keep the generic
+// Vercel routing test out of public BYOK transport mode; that policy is tested
+// separately in tests/byok.test.js with mock-only provider traffic.
+process.env.BLUE_PUBLIC_BYOK = 'false';
 process.env.DATABASE_URL = '';
 process.env.POSTGRES_URL = '';
 process.env.POSTGRES_URL_NON_POOLING = '';
@@ -67,7 +71,7 @@ test('Vercel production refuses to start without durable storage and a stable se
 
   const missingSecret = runConfig({ DATABASE_URL: 'postgres://user:password@example.invalid/database' });
   assert.notEqual(missingSecret.status, 0);
-  assert.match(missingSecret.stderr, /requires a stable BLUE_SESSION_SECRET/);
+  assert.match(missingSecret.stderr, /BLUE_SESSION_SECRET.*32 characters/);
 });
 
 test('serverless Express entry point serves API and browser assets without opening its own listener', async () => {
