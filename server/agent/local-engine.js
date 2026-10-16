@@ -36,6 +36,21 @@ const NEWSY = /\b(latest|current|today'?s?|recent|now|this week|2024|2025|2026)\
 const QUESTION_START = /^(who|what|which|where|when|how much|how many)\s+(is|are|was|were|does|did|do)\b/i;
 const PRICEY = /\b(price|prices|cost|stock|net worth|release date|weather|score|population)\b/i;
 
+// Route a pasted URL to the page reader instead of giving generic help.
+// Restrict bare-host recognition to common public TLDs so dotted identifiers
+// and private-looking email addresses do not accidentally become fetch targets.
+const TLD = 'com|org|net|io|dev|ai|co|edu|gov|info|biz|app|xyz|me|us|uk|in|de|fr|jp|au|ca|sh|so|to|gg|tv|news|blog|site|online|store|tech|cloud|works|wiki';
+const SCHEME_URL = /\\bhttps?:\\/\\/[^\\s<>"'\`\\)\\]]+/i;
+const BARE_URL = new RegExp(`\\\\b(?:www\\\\.)?[a-z0-9][a-z0-9-]*(?:\\\\.[a-z0-9-]+)*\\\\.(?:${TLD})(?:\\\\/[^\\\\s<>"'\`\\)\\]]*)?`, 'i');
+const FETCH_VERBS = /\\b(fetch|open|read|load|visit|pull up|grab|scrape|summari[sz]e|summarise|digest|extract|review|check out|look at|what does)\\b/i;
+
+/** Pull the first URL out of a message, with or without an https:// scheme. */
+export function extractUrl(text) {
+  const trimmed = String(text || '');
+  const match = SCHEME_URL.exec(trimmed) || BARE_URL.exec(trimmed);
+  return match ? match[0].replace(/[.,;:!?]+$/, '') : '';
+}
+
 export function detectIntent(text) {
   const raw = String(text || '').trim();
   const t = lower(raw);
@@ -79,6 +94,13 @@ export function detectIntent(text) {
   // calculator
   const calcMatch = /^(?:what(?:'s| is)\s+)?(?:calc(?:ulate)?\s*:?\s*)?(.+)$/i.exec(raw);
   if (calcMatch && looksLikeMath(calcMatch[1])) return { kind: 'calculator', expression: cleanExpression(calcMatch[1]) };
+
+  // A pasted page URL should be read, not searched around. An explicit
+  // "search the web for <URL>" remains a search request.
+  const url = extractUrl(raw);
+  if (url && !(SEARCH_VERBS.test(raw) && !FETCH_VERBS.test(raw))) {
+    return { kind: 'fetch_page', url };
+  }
 
   // Deep research uses several focused queries and keeps the source trail.
   if (/\bdeep research\b|\bresearch brief\b|\bliterature review\b|\bcomprehensive report\b|\binvestigate\b|\bcompare .{0,80}sources\b/i.test(raw) || /^research\b/i.test(raw)) {
@@ -347,6 +369,19 @@ export async function* runLocalEngine({ messages, tools = [], context = {} }) {
         return;
       }
       yield* emitTool('calculator', { expression: intent.expression });
+      yield { type: 'end', finishReason: 'tool_calls' };
+      return;
+    }
+
+    case 'fetch_page': {
+      if (!toolNames.has('fetch_page')) {
+        yield* streamText(
+          `Reading pages is switched off in your settings, so I can't open ${intent.url}. Enable \`fetch_page\` in Settings → Tools.`,
+        );
+        yield { type: 'end', finishReason: 'stop' };
+        return;
+      }
+      yield* emitTool('fetch_page', { url: intent.url, max_chars: 6000 }, `_Fetching ${intent.url}…_`);
       yield { type: 'end', finishReason: 'tool_calls' };
       return;
     }
